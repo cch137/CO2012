@@ -12,7 +12,7 @@ int main()
 {
   DBBenchmarkResult *result;
 
-  printf("%6s %12s %16s %16s %16s\n", "db", "sample_size", "Write TU (ms)", "Read TU (ms)", "mem. used (b)");
+  printf("%6s %12s %16s %16s %16s\n", "db", "sample_size", "Write TU (ms)", "Read TU (ms)", "Mem. used (B)");
 
   for (int j = 0; j < 5; j++)
   {

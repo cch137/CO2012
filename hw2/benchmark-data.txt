@@ -1,4 +1,4 @@
-    db  sample_size    Write TU (ms)     Read TU (ms)    mem. used (b)
+    db  sample_size    Write TU (ms)     Read TU (ms)    Mem. used (B)
  hw1db        10000               20               31         10026256 
  redis        10000              159              110          4392640 
  hw1db        20000               39               65         20114502 
