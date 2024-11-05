@@ -1,0 +1,262 @@
+{
+	"Zane":	{
+		"name":	"Zane",
+		"jobTitle":	"Tech Lead",
+		"age":	36,
+		"address":	"654 Pineapple St",
+		"phoneNumbers":	["333-444-5555"],
+		"emailAddresses":	["zane@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Sam":	{
+		"name":	"Sam",
+		"jobTitle":	"System Administrator",
+		"age":	34,
+		"address":	"654 Linden St",
+		"phoneNumbers":	["666-777-8888"],
+		"emailAddresses":	["sam@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Xander":	{
+		"name":	"Xander",
+		"jobTitle":	"Software Tester",
+		"age":	30,
+		"address":	"789 Olive St",
+		"phoneNumbers":	["111-222-3333"],
+		"emailAddresses":	["xander@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Alice":	{
+		"name":	"Alice",
+		"jobTitle":	"Software Engineer",
+		"age":	30,
+		"address":	"123 Main St",
+		"phoneNumbers":	["123-456-7890", "098-765-4321"],
+		"emailAddresses":	["alice@example.com", "alice.work@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Olivia":	{
+		"name":	"Olivia",
+		"jobTitle":	"Marketing Specialist",
+		"age":	27,
+		"address":	"123 Cherry St",
+		"phoneNumbers":	["222-333-4444"],
+		"emailAddresses":	["olivia@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Mia":	{
+		"name":	"Mia",
+		"jobTitle":	"Graphic Designer",
+		"age":	26,
+		"address":	"876 Cypress St",
+		"phoneNumbers":	["000-111-2222"],
+		"emailAddresses":	["mia@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Bob":	{
+		"name":	"Bob",
+		"jobTitle":	"Data Scientist",
+		"age":	25,
+		"address":	"456 Elm St",
+		"phoneNumbers":	["555-123-4567"],
+		"emailAddresses":	["bob@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Diana":	{
+		"name":	"Diana",
+		"jobTitle":	"Product Manager",
+		"age":	32,
+		"address":	"321 Pine St",
+		"phoneNumbers":	["111-222-3333"],
+		"emailAddresses":	["diana@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Karen":	{
+		"name":	"Karen",
+		"jobTitle":	"Technical Writer",
+		"age":	34,
+		"address":	"321 Chestnut St",
+		"phoneNumbers":	["888-999-0000"],
+		"emailAddresses":	["karen@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Leo":	{
+		"name":	"Leo",
+		"jobTitle":	"Full Stack Developer",
+		"age":	30,
+		"address":	"654 Poplar St",
+		"phoneNumbers":	["999-000-1111"],
+		"emailAddresses":	["leo@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Jack":	{
+		"name":	"Jack",
+		"jobTitle":	"Network Engineer",
+		"age":	29,
+		"address":	"789 Willow St",
+		"phoneNumbers":	["777-888-9999"],
+		"emailAddresses":	["jack@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Quinn":	{
+		"name":	"Quinn",
+		"jobTitle":	"Business Analyst",
+		"age":	31,
+		"address":	"789 Hickory St",
+		"phoneNumbers":	["444-555-6666"],
+		"emailAddresses":	["quinn@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Hank":	{
+		"name":	"Hank",
+		"jobTitle":	"Database Administrator",
+		"age":	31,
+		"address":	"123 Redwood St",
+		"phoneNumbers":	["555-666-7777"],
+		"emailAddresses":	["hank@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Victor":	{
+		"name":	"Victor",
+		"jobTitle":	"Project Manager",
+		"age":	33,
+		"address":	"123 Dogwood St",
+		"phoneNumbers":	["999-000-1111"],
+		"emailAddresses":	["victor@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Rachel":	{
+		"name":	"Rachel",
+		"jobTitle":	"Content Strategist",
+		"age":	29,
+		"address":	"321 Maplewood St",
+		"phoneNumbers":	["555-666-7777"],
+		"emailAddresses":	["rachel@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Grace":	{
+		"name":	"Grace",
+		"jobTitle":	"AI Researcher",
+		"age":	27,
+		"address":	"987 Cedar St",
+		"phoneNumbers":	["444-555-6666"],
+		"emailAddresses":	["grace@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Paul":	{
+		"name":	"Paul",
+		"jobTitle":	"QA Engineer",
+		"age":	32,
+		"address":	"456 Beech St",
+		"phoneNumbers":	["333-444-5555"],
+		"emailAddresses":	["paul@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Yara":	{
+		"name":	"Yara",
+		"jobTitle":	"Sales Manager",
+		"age":	32,
+		"address":	"321 Cedarwood St",
+		"phoneNumbers":	["222-333-4444"],
+		"emailAddresses":	["yara@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Tina":	{
+		"name":	"Tina",
+		"jobTitle":	"Operations Manager",
+		"age":	35,
+		"address":	"876 Ash St",
+		"phoneNumbers":	["777-888-9999"],
+		"emailAddresses":	["tina@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Ivy":	{
+		"name":	"Ivy",
+		"jobTitle":	"Cloud Architect",
+		"age":	33,
+		"address":	"456 Spruce St",
+		"phoneNumbers":	["666-777-8888"],
+		"emailAddresses":	["ivy@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Uma":	{
+		"name":	"Uma",
+		"jobTitle":	"HR Specialist",
+		"age":	30,
+		"address":	"987 Pinecone St",
+		"phoneNumbers":	["888-999-0000"],
+		"emailAddresses":	["uma@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Nathan":	{
+		"name":	"Nathan",
+		"jobTitle":	"Frontend Developer",
+		"age":	28,
+		"address":	"987 Walnut St",
+		"phoneNumbers":	["111-222-3333"],
+		"emailAddresses":	["nathan@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Eve":	{
+		"name":	"Eve",
+		"jobTitle":	"DevOps Engineer",
+		"age":	29,
+		"address":	"654 Maple St",
+		"phoneNumbers":	["222-333-4444"],
+		"emailAddresses":	["eve@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Frank":	{
+		"name":	"Frank",
+		"jobTitle":	"Security Analyst",
+		"age":	35,
+		"address":	"876 Birch St",
+		"phoneNumbers":	["333-444-5555"],
+		"emailAddresses":	["frank@example.com"],
+		"isMarried":	true,
+		"isEmployed":	true
+	},
+	"Charlie":	{
+		"name":	"Charlie",
+		"jobTitle":	"UX Designer",
+		"age":	28,
+		"address":	"789 Oak St",
+		"phoneNumbers":	["987-654-3210"],
+		"emailAddresses":	["charlie@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	},
+	"Wendy":	{
+		"name":	"Wendy",
+		"jobTitle":	"SEO Specialist",
+		"age":	28,
+		"address":	"456 Fir St",
+		"phoneNumbers":	["000-111-2222"],
+		"emailAddresses":	["wendy@example.com"],
+		"isMarried":	false,
+		"isEmployed":	true
+	}
+}

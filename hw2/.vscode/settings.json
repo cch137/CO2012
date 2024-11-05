@@ -1,0 +1,26 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "ms-vscode.cpptools",
+  "files.associations": {
+    "*.ejs": "html",
+    "typeinfo": "c",
+    "cjson.h": "c",
+    "stdbool.h": "c",
+    "database.h": "c",
+    "interface.h": "c",
+    "compare": "c",
+    "type_traits": "c",
+    "utils.h": "c",
+    "pthread.h": "c",
+    "testbench.h": "c",
+    "string.h": "c",
+    "stdlib.h": "c",
+    "benchmark.h": "c",
+    "stdio.h": "c",
+    "hiredis.h": "c",
+    "time.h": "c",
+    "unistd.h": "c",
+    "resource.h": "c"
+  },
+  "cmake.ignoreCMakeListsMissing": true
+}

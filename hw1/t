@@ -1,0 +1,2 @@
+gcc -o test test.c cJSON.c database.c interface.c
+./test

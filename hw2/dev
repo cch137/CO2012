@@ -1,0 +1,51 @@
+#!/bin/bash
+
+current_pid=0
+last_modified_file=""
+last_modified_time=0
+
+DEBOUNCE_INTERVAL_MS=1500  # Time interval in milliseconds to prevent duplicate triggers
+WATCHED_FILE_PATTERN=".*\.(c|h)$"  # File extensions to watch
+EXECUTABLE_NAME="main"  # Name of the output executable
+BUILD_COMMAND="gcc -o $EXECUTABLE_NAME main.c cJSON.c database.c interface.c benchmark.c -lhiredis"  # Build command
+
+function compile_and_run {
+    # Terminate the previous process if it's still running
+    if [ $current_pid -ne 0 ] && kill -0 $current_pid 2>/dev/null; then
+        kill $current_pid
+        wait $current_pid 2>/dev/null
+    fi
+
+    # Compile the program
+    eval $BUILD_COMMAND
+    if [ $? -eq 0 ]; then
+        ./$EXECUTABLE_NAME &
+        current_pid=$!
+    else
+        echo -e "\n\e[31mCompilation failed. Skipping execution.\e[0m\n"
+    fi
+}
+
+function monitor_files {
+    compile_and_run
+
+    inotifywait -m -r -e modify --format '%w%f' --include "$WATCHED_FILE_PATTERN" . |
+    while read -r modified_file; do
+        current_time=$(date +%s%N)
+        current_time_ms=$((current_time / 1000000))
+        # Skip if the same file change is detected within the debounce interval
+        if [[ "$modified_file" == "$last_modified_file" && $((current_time_ms - last_modified_time)) -lt $DEBOUNCE_INTERVAL_MS ]]; then
+            continue
+        fi
+        
+        last_modified_file="$modified_file"
+        last_modified_time=$current_time_ms
+
+        echo -e "\n\e[31mFile $modified_file changed, recompiling and running...\e[0m\n"
+        compile_and_run
+    done
+}
+
+trap "kill $current_pid 2>/dev/null" EXIT
+
+monitor_files

@@ -1,0 +1,16 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "ms-vscode.cpptools",
+  "files.associations": {
+    "*.ejs": "html",
+    "typeinfo": "c",
+    "cjson.h": "c",
+    "stdbool.h": "c",
+    "database.h": "c",
+    "interface.h": "c",
+    "compare": "c",
+    "type_traits": "c",
+    "utils.h": "c",
+    "pthread.h": "c"
+  }
+}
