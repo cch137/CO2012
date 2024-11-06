@@ -22,14 +22,14 @@ function compile_and_run {
         ./$EXECUTABLE_NAME &
         current_pid=$!
     else
-        echo -e "\n\e[31mCompilation failed. Skipping execution.\e[0m\n"
+        echo -e "\n\e[41;37mCompilation failed. Skipping execution.\e[0m\n"
     fi
 }
 
 function monitor_files {
     compile_and_run
 
-    inotifywait -m -r -e modify --format '%w%f' --include "$WATCHED_FILE_PATTERN" . |
+    inotifywait -m -r -e modify --format '%w%f' --include "$WATCHED_FILE_PATTERN" --quiet . |
     while read -r modified_file; do
         current_time=$(date +%s%N)
         current_time_ms=$((current_time / 1000000))
@@ -41,7 +41,7 @@ function monitor_files {
         last_modified_file="$modified_file"
         last_modified_time=$current_time_ms
 
-        echo -e "\n\e[31mFile $modified_file changed, recompiling and running...\e[0m\n"
+        echo -e "\n\e[44;37mFile $modified_file changed, recompiling and running...\e[0m\n"
         compile_and_run
     done
 }

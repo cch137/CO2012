@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include "./cJSON.h"
 
 #define REDIS_IP "localhost"
 #define REDIS_PORT 6379
@@ -58,7 +59,7 @@ static clock_t end_timer(clock_t start_at);
 // Memory Usage functions
 
 // Calculates the memory usage of a cJSON object
-size_t get_cjson_memory_usage(const cJSON *item);
+size_t get_cjson_memory_usage(cJSON *item);
 // Calculates the memory usage of the hash table database
 size_t get_db_hash_table_memory_usage();
 // Gets Redis memory usage information

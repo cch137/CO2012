@@ -1,8 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
-#include <unistd.h>
+#include <malloc.h>
 #include <hiredis/hiredis.h>
 #include "./database.h"
 #include "./interface.h"
@@ -16,7 +15,7 @@ static char *_benchmark_strdup(const char *source)
 {
   if (!source)
     return NULL;
-  char *dup = (char *)calloc(strlen(source) + 1, sizeof(char));
+  char *dup = (char *)malloc((strlen(source) + 1) * sizeof(char));
   if (!dup)
     memory_error_handler(__FILE__, __LINE__, __func__);
   else
@@ -34,7 +33,7 @@ static clock_t end_timer(clock_t start_at)
   return (clock() - start_at) * 1000 / CLOCKS_PER_SEC;
 }
 
-size_t get_cjson_memory_usage(const cJSON *item)
+size_t get_cjson_memory_usage(cJSON *item)
 {
   if (!item)
     return 0;
@@ -43,10 +42,10 @@ size_t get_cjson_memory_usage(const cJSON *item)
 
   while (item != NULL)
   {
-    size += sizeof(cJSON);
+    size += malloc_usable_size(item);
     if (cJSON_IsString(item) && item->valuestring != NULL)
     {
-      size += strlen(item->valuestring) + 1;
+      size += malloc_usable_size(item->valuestring);
     }
     else if (cJSON_IsArray(item) || cJSON_IsObject(item))
     {
@@ -55,7 +54,7 @@ size_t get_cjson_memory_usage(const cJSON *item)
 
     if (item->string != NULL)
     {
-      size += strlen(item->string) + 1;
+      size += malloc_usable_size(item->string);
     }
 
     item = item->next; // Move to the next item in the chain
@@ -69,16 +68,17 @@ size_t get_db_hash_table_memory_usage()
   if (!db_hash_table)
     return 0;
 
-  size_t size = sizeof(db_hash_table) + sizeof(db_hash_table) * db_hash_table_size;
+  size_t size = malloc_usable_size(db_hash_table);
+  DBItem *item;
 
   for (int i = 0; i < db_hash_table_size; ++i)
   {
-    DBItem *item = db_hash_table[i];
+    item = db_hash_table[i];
     while (item != NULL)
     {
       size += get_cjson_memory_usage(item->json);
-      size += sizeof(DBItem);
-      size += strlen(item->key) + 1;
+      size += malloc_usable_size(item);
+      size += malloc_usable_size(item->key);
       item = item->next;
     }
   }
@@ -94,7 +94,6 @@ PersonSample *generate_person_sample(int i)
 
   if (!person)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(person, 0, sizeof(PersonSample));
 
   snprintf(tempStringBuffer, sizeof(tempStringBuffer), "test_person_%d", i);
   tempStringBuffer[sizeof(tempStringBuffer) - 1] = '\0';
@@ -188,7 +187,6 @@ PersonSample *cJSON_to_person(const cJSON *person)
 
   if (!newPerson)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(newPerson, 0, sizeof(PersonSample));
 
   newPerson->name = _benchmark_strdup(cJSON_GetObjectItem(person, "name")->valuestring);
   newPerson->jobTitle = _benchmark_strdup(cJSON_GetObjectItem(person, "jobTitle")->valuestring);
@@ -218,7 +216,7 @@ void redis_write_person_sample(const char *key, const PersonSample *person)
   size_t phoneNumbersLen = 0;
   for (int i = 0; i < person->phoneNumberCount; i++)
     phoneNumbersLen += strlen(person->phoneNumbers[i]) + 1;
-  char *phoneNumbers = (char *)calloc(phoneNumbersLen, sizeof(char));
+  char *phoneNumbers = (char *)malloc(phoneNumbersLen * sizeof(char));
   phoneNumbers[0] = '\0';
   for (int i = 0; i < person->phoneNumberCount; i++)
   {
@@ -230,7 +228,7 @@ void redis_write_person_sample(const char *key, const PersonSample *person)
   size_t emailAddressesLen = 0;
   for (int i = 0; i < person->emailAddressCount; i++)
     emailAddressesLen += strlen(person->emailAddresses[i]) + 1;
-  char *emailAddresses = (char *)calloc(emailAddressesLen, sizeof(char));
+  char *emailAddresses = (char *)malloc(emailAddressesLen * sizeof(char));
   emailAddresses[0] = '\0';
   for (int i = 0; i < person->emailAddressCount; i++)
   {
@@ -279,10 +277,9 @@ PersonSample *redis_read_person_sample(const char *key)
   }
 
   // Allocate memory for the PersonSample object
-  PersonSample *person = (PersonSample *)malloc(sizeof(PersonSample));
+  PersonSample *person = (PersonSample *)calloc(1, sizeof(PersonSample));
   if (!person)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(person, 0, sizeof(PersonSample));
 
   // Parse Redis fields to populate PersonSample attributes
   for (size_t i = 0; i < reply->elements; i += 2)
@@ -413,7 +410,6 @@ DBTester *create_tester(int32_t sample_size)
   DBTester *tester = (DBTester *)malloc(sizeof(DBTester));
   if (!tester)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(tester, 0, sizeof(DBTester));
 
   tester->sample_size = sample_size;
 
@@ -422,7 +418,6 @@ DBTester *create_tester(int32_t sample_size)
 
   if (!tester->samples)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(tester->samples, 0, sample_size * sizeof(PersonSample *));
 
   for (int i = 1; i <= sample_size; i++)
     tester->samples[i - 1] = generate_person_sample(i);
@@ -455,9 +450,6 @@ DBResourceUsage *exec_tester(DBTester *tester)
 
   if (!usage || !read_results)
     memory_error_handler(__FILE__, __LINE__, __func__);
-
-  memset(usage, 0, sizeof(DBResourceUsage));
-  memset(read_results, 0, tester->sample_size * sizeof(PersonSample *));
 
   PersonSample **samples = tester->samples;
   uint32_t sample_size = tester->sample_size;
@@ -515,7 +507,6 @@ DBBenchmarkResult *run_db_benchmark(int32_t sample_size)
 
   if (!result)
     memory_error_handler(__FILE__, __LINE__, __func__);
-  memset(result, 0, sizeof(DBBenchmarkResult));
 
   result->sample_size = sample_size;
 
