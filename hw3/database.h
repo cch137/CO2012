@@ -15,19 +15,19 @@ typedef uint32_t db_size_t;
 #define DB_TYPE_STRING (DBValueType)(1)
 #define DB_TYPE_LIST (DBValueType)(2)
 
-typedef struct DLLNode
+typedef struct DLNode
 {
   char *data;
-  struct DLLNode *prev;
-  struct DLLNode *next;
-} DLLNode;
+  struct DLNode *prev;
+  struct DLNode *next;
+} DLNode;
 
 typedef struct DLList
 {
   // Pointer to the first node in the list
-  DLLNode *head;
+  DLNode *head;
   // Pointer to the last node in the list
-  DLLNode *tail;
+  DLNode *tail;
   // Number of nodes in the list
   db_size_t length;
 } DLList;
@@ -156,7 +156,7 @@ bool db_rename(const char *old_key, const char *new_key);
 bool db_del(const char *key);
 
 // Creates a new node for a doubly linked list with specified data
-static DLLNode *create_DLLNode(const char *data, DLLNode *prev, DLLNode *next);
+static DLNode *create_DLNode(const char *data, DLNode *prev, DLNode *next);
 
 // Initializes a new, empty doubly linked list
 static DLList *create_DLList();
@@ -171,7 +171,7 @@ static DLList *get_or_create_DLList(const char *key);
 static DLList *duplicate_DLList(DLList *list);
 
 // Frees a list node and all its sibling nodes
-void db_free_DLLNode(DLLNode *node);
+void db_free_DLNode(DLNode *node);
 
 // Frees an entire list and all of its nodes
 void db_free_DLList(DLList *list);
@@ -180,13 +180,13 @@ void db_free_DLList(DLList *list);
 db_size_t db_lpush(const char *key, ...);
 
 // Pops elements from the front of a list
-DLLNode *db_lpop(const char *key, db_size_t count);
+DLNode *db_lpop(const char *key, db_size_t count);
 
 // Pushes elements to the end of a list; last parameter must be NULL
 db_size_t db_rpush(const char *key, ...);
 
 // Pops elements from the end of a list
-DLLNode *db_rpop(const char *key, db_size_t count);
+DLNode *db_rpop(const char *key, db_size_t count);
 
 // Returns the number of nodes in a list
 db_size_t db_llen(const char *key);

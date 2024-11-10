@@ -235,7 +235,7 @@ void db_save()
 
   cJSON *root = cJSON_CreateObject();
   HTEntry *entry;
-  DLLNode *dllnode;
+  DLNode *dllnode;
   cJSON *cjson_list;
 
   for (int j = 0; j < 2; j++)
@@ -306,7 +306,7 @@ size_t db_dataset_memory_usage()
 
   size_t size = 2 * sizeof(HashTable *);
   HTEntry *entry;
-  DLLNode *dllnode;
+  DLNode *dllnode;
 
   for (int j = 0; j < 2; j++)
   {
@@ -673,9 +673,9 @@ bool db_del(const char *key)
   return true;
 }
 
-static DLLNode *create_DLLNode(const char *data, DLLNode *prev, DLLNode *next)
+static DLNode *create_DLNode(const char *data, DLNode *prev, DLNode *next)
 {
-  DLLNode *node = malloc(sizeof(DLLNode));
+  DLNode *node = malloc(sizeof(DLNode));
   if (!node)
     memory_error_handler(__FILE__, __LINE__, __func__);
   node->data = helper_strdup(data);
@@ -730,11 +730,11 @@ static DLList *get_or_create_DLList(const char *key)
 static DLList *duplicate_DLList(DLList *list)
 {
   DLList *new_list = create_DLList();
-  DLLNode *curr_node = list->tail;
+  DLNode *curr_node = list->tail;
 
   while (curr_node)
   {
-    new_list->head = create_DLLNode(curr_node->data, NULL, new_list->head);
+    new_list->head = create_DLNode(curr_node->data, NULL, new_list->head);
     if (new_list->head->next)
       new_list->head->next->prev = new_list->head;
     if (!new_list->tail)
@@ -747,13 +747,13 @@ static DLList *duplicate_DLList(DLList *list)
   return new_list;
 }
 
-void db_free_DLLNode(DLLNode *node)
+void db_free_DLNode(DLNode *node)
 {
   if (!node)
     return;
 
-  DLLNode *curr_neighbour = node->prev;
-  DLLNode *next_neighbour;
+  DLNode *curr_neighbour = node->prev;
+  DLNode *next_neighbour;
 
   while (curr_neighbour)
   {
@@ -781,7 +781,7 @@ void db_free_DLList(DLList *list)
   if (!list)
     return;
 
-  db_free_DLLNode(list->head);
+  db_free_DLNode(list->head);
   free(list);
 }
 
@@ -800,12 +800,12 @@ db_size_t db_lpush(const char *key, ...)
   va_list items;
   va_start(items, key);
 
-  DLLNode *node;
+  DLNode *node;
 
   char *value;
   while ((value = (char *)va_arg(items, char *)) != NULL)
   {
-    node = create_DLLNode(value, NULL, list->head);
+    node = create_DLNode(value, NULL, list->head);
     if (list->head)
       list->head->prev = node;
     list->head = node;
@@ -817,7 +817,7 @@ db_size_t db_lpush(const char *key, ...)
   return pthread_mutex_unlock(global_mutex), list->length;
 }
 
-DLLNode *db_lpop(const char *key, db_size_t count)
+DLNode *db_lpop(const char *key, db_size_t count)
 {
   if (!key || count == 0)
     return NULL;
@@ -829,8 +829,8 @@ DLLNode *db_lpop(const char *key, db_size_t count)
   if (!list || count == 0)
     return pthread_mutex_unlock(global_mutex), NULL;
 
-  DLLNode *head_node = list->head;
-  DLLNode *tail_node = list->head;
+  DLNode *head_node = list->head;
+  DLNode *tail_node = list->head;
 
   if (!head_node)
     return pthread_mutex_unlock(global_mutex), NULL;
@@ -872,12 +872,12 @@ db_size_t db_rpush(const char *key, ...)
   va_list items;
   va_start(items, key);
 
-  DLLNode *node;
+  DLNode *node;
 
   char *value;
   while ((value = (char *)va_arg(items, char *)) != NULL)
   {
-    node = create_DLLNode(value, list->tail, NULL);
+    node = create_DLNode(value, list->tail, NULL);
     if (list->tail)
       list->tail->next = node;
     list->tail = node;
@@ -889,7 +889,7 @@ db_size_t db_rpush(const char *key, ...)
   return pthread_mutex_unlock(global_mutex), list->length;
 }
 
-DLLNode *db_rpop(const char *key, db_size_t count)
+DLNode *db_rpop(const char *key, db_size_t count)
 {
   if (!key || count == 0)
     return NULL;
@@ -901,8 +901,8 @@ DLLNode *db_rpop(const char *key, db_size_t count)
   if (!list || count == 0)
     return pthread_mutex_unlock(global_mutex), NULL;
 
-  DLLNode *head_node = list->tail;
-  DLLNode *tail_node = list->tail;
+  DLNode *head_node = list->tail;
+  DLNode *tail_node = list->tail;
 
   if (!head_node)
     return pthread_mutex_unlock(global_mutex), NULL;
@@ -970,8 +970,8 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
     return pthread_mutex_unlock(global_mutex), duplicate_DLList(list);
 
   DLList *new_list = create_DLList();
-  DLLNode *new_node = NULL;
-  DLLNode *curr_node;
+  DLNode *new_node = NULL;
+  DLNode *curr_node;
   db_size_t index;
 
   if (start > list->length - 1 - stop)
@@ -985,7 +985,7 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
     }
     while (index >= start && curr_node)
     {
-      new_node = create_DLLNode(curr_node->data, NULL, new_node);
+      new_node = create_DLNode(curr_node->data, NULL, new_node);
       if (!new_list->tail)
         new_list->tail = new_node;
       if (new_node->next)
@@ -1006,7 +1006,7 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
     }
     while (index <= stop && curr_node)
     {
-      new_node = create_DLLNode(curr_node->data, new_node, NULL);
+      new_node = create_DLNode(curr_node->data, new_node, NULL);
       if (!new_list->head)
         new_list->head = new_node;
       if (new_node->prev)
