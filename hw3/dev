@@ -2,14 +2,17 @@
 
 current_pid=0
 last_modified_file=""
-last_modified_time=0
+last_modified_time_ms=0
 
-DEBOUNCE_INTERVAL_MS=1500  # Time interval in milliseconds to prevent duplicate triggers
-WATCHED_FILE_PATTERN=".*\.(c|h)$"  # File extensions to watch
-EXECUTABLE_NAME="main"  # Name of the output executable
-BUILD_COMMAND="gcc -o $EXECUTABLE_NAME main.c cJSON.c database.c interface.c benchmark.c -lhiredis"  # Build command
+DEBOUNCE_INTERVAL_MS=1500      # Debounce interval in milliseconds to prevent duplicate triggers
+WATCH_PATTERN=".*\.(c|h)$"     # Pattern for watched file extensions
+OUTPUT_EXECUTABLE="main"       # Name of the output executable
 
 function compile_and_run {
+    # Find all .c files in the current directory and subdirectories
+    c_files=$(find . -type f -name "*.c" -print | tr '\n' ' ')
+    compile_command="gcc -o $OUTPUT_EXECUTABLE $c_files -lhiredis -ljemalloc"  # Build command
+
     # Terminate the previous process if it's still running
     if [ $current_pid -ne 0 ] && kill -0 $current_pid 2>/dev/null; then
         kill $current_pid
@@ -17,9 +20,9 @@ function compile_and_run {
     fi
 
     # Compile the program
-    eval $BUILD_COMMAND
+    eval $compile_command
     if [ $? -eq 0 ]; then
-        ./$EXECUTABLE_NAME &
+        ./$OUTPUT_EXECUTABLE &
         current_pid=$!
     else
         echo -e "\n\e[41;37mCompilation failed. Skipping execution.\e[0m\n"
@@ -29,17 +32,17 @@ function compile_and_run {
 function monitor_files {
     compile_and_run
 
-    inotifywait -m -r -e modify --format '%w%f' --include "$WATCHED_FILE_PATTERN" --quiet . |
+    inotifywait -m -r -e modify --format '%w%f' --include "$WATCH_PATTERN" --quiet . |
     while read -r modified_file; do
-        current_time=$(date +%s%N)
-        current_time_ms=$((current_time / 1000000))
+        current_time_ms=$(($(date +%s%N) / 1000000))
+
         # Skip if the same file change is detected within the debounce interval
-        if [[ "$modified_file" == "$last_modified_file" && $((current_time_ms - last_modified_time)) -lt $DEBOUNCE_INTERVAL_MS ]]; then
+        if [[ "$modified_file" == "$last_modified_file" && $((current_time_ms - last_modified_time_ms)) -lt $DEBOUNCE_INTERVAL_MS ]]; then
             continue
         fi
-        
+
         last_modified_file="$modified_file"
-        last_modified_time=$current_time_ms
+        last_modified_time_ms=$current_time_ms
 
         echo -e "\n\e[44;37mFile $modified_file changed, recompiling and running...\e[0m\n"
         compile_and_run

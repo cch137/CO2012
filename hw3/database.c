@@ -1,499 +1,1023 @@
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
-#include "./database.h"
-#include "./interface.h"
+#include <time.h>
+#include <stdarg.h>
+#include <malloc.h>
+#include <unistd.h>
 
-#define HASH_MOD 5831
-#define HASH_SHIFT_BITS 5
+#include "deps/cJSON.h"
+#include "utils.h"
+#include "database.h"
 
-// #define HASH_TABLE_SIZE 137
-// We no longer do this because we need to support dynamic hash table sizes.
+// Initial size of the hash table
+#define INITIAL_TABLE_SIZE 16
 
-#define hash_table_size db_hash_table_size
-#define hash_table db_hash_table
+// Load factor threshold for expanding the hash table
+#define LOAD_FACTOR_EXPAND 0.7
 
-size_t hash_table_size = 0;
-DBItem **hash_table = NULL;
+// Load factor threshold for shrinking the hash table
+#define LOAD_FACTOR_SHRINK 0.1
 
-pthread_mutex_t _db_mutex = PTHREAD_MUTEX_INITIALIZER;
-// The mutex is locked while the database is being read and written.
-// We will not destroy the mutex because it has a continuing purpose in the program.
-pthread_mutex_t *db_mutex = &_db_mutex;
+#define DEFAULT_CRON_HZ 10
+#define DEFAULT_REHASH_IDLE_THRESHOLD 10000
+#define DEFAULT_PERSISTENCE_FILE "db.json"
 
-unsigned long static hash(const char *string);
-DBItem static *create_item_with_json(const char *key, cJSON *json);
-DBItem static *add_item_to_hash_table(const char *key, DBItem *item);
-DBItem static *remove_item_from_hash_table(const char *key);
-DBItem static *set_item_key(DBItem *item, const char *key);
+// Seed for the hash function, affecting hash distribution
+static db_size_t hash_seed = 0;
+// Threshold of idle tasks before rehashing starts
+static db_size_t rehash_idle_threshold = DEFAULT_REHASH_IDLE_THRESHOLD;
+// Frequency of periodic task execution per second
+static uint8_t cron_hz = DEFAULT_CRON_HZ;
+// File path for database persistence
+static char *persistence_filepath = NULL;
+// Task function to run periodically at a rate set by cron_hz
+static void (*scheduled_task)() = NULL;
 
-// DJB2 hash
-unsigned long static hash(const char *string)
+// tables[0] is the main table, tables[1] is the rehash table
+// During rehashing, entries are first searched and deleted from tables[1], then from tables[0].
+// New entries are only written to tables[1] during rehashing.
+// After rehashing is complete, tables[0] is freed and tables[1] is moved to the main table.
+static HashTable *tables[2] = {NULL, NULL};
+
+// -1 indicates no rehashing; otherwise, it's the current rehashing index
+// The occurrence of rehashing is determined by periodic tasks; when rehashing starts, rehashing_index will be the last index of the table size
+// Rehashing will be handled during periodic task execution and during db_insert_entry and db_get_entry.
+static db_count_t rehashing_index = -1;
+
+// Records the count of recent tasks
+static db_size_t recent_tasks_count = 0;
+
+static pthread_mutex_t *global_mutex = NULL;
+static pthread_t cron_thread;
+static bool cron_is_running = false;
+
+static db_size_t murmurhash2(const void *key, db_size_t len)
 {
-  if (string == NULL)
-    return 0;
+  const db_size_t m = 0x5bd1e995;
+  const int r = 24;
+  db_size_t h = hash_seed ^ len;
 
-  unsigned long hash_value = HASH_MOD;
-  int current_char;
-  while ((current_char = *string++))
+  const unsigned char *data = (const unsigned char *)key;
+
+  while (len >= 4)
   {
-    hash_value = ((hash_value << HASH_SHIFT_BITS) + hash_value) + current_char;
+    db_size_t k = *(db_size_t *)data;
+    k *= m, k ^= k >> r, k *= m;
+    h *= m, h ^= k;
+    data += 4, len -= 4;
   }
-  return hash_value % hash_table_size;
+
+  switch (len)
+  {
+  case 3:
+    h ^= data[2] << 16;
+  case 2:
+    h ^= data[1] << 8;
+  case 1:
+    h ^= data[0];
+    h *= m;
+  }
+
+  h ^= h >> 13, h *= m, h ^= h >> 15;
+
+  return h;
 }
 
-DBItem static *create_item_with_json(const char *key, cJSON *json)
+static pthread_mutex_t *init_pthread_mutex(pthread_mutex_t *mutex)
 {
-  if (json == NULL)
-    return NULL;
+  if (!mutex)
+  {
+    mutex = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
+    if (!mutex)
+      memory_error_handler(__FILE__, __LINE__, __func__);
+    pthread_mutex_init(mutex, NULL);
+  }
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE_NP);
+  pthread_mutex_init(mutex, &attr);
+  pthread_mutexattr_destroy(&attr);
+  return mutex;
+}
 
-  DBItem *item = (DBItem *)malloc(sizeof(DBItem));
+void db_start(DBConfig *config)
+{
+  if (!global_mutex)
+    global_mutex = init_pthread_mutex(NULL);
 
-  if (!item)
+  pthread_mutex_lock(global_mutex);
+
+  if (config && config->hash_seed)
+    hash_seed = config->hash_seed;
+  else
+    hash_seed = (db_size_t)time(NULL);
+
+  if (config && config->rehash_idle_threshold)
+    rehash_idle_threshold = config->rehash_idle_threshold;
+  else
+    rehash_idle_threshold = DEFAULT_REHASH_IDLE_THRESHOLD;
+
+  if (config && config->cron_hz)
+    cron_hz = config->cron_hz;
+  else
+    cron_hz = DEFAULT_CRON_HZ;
+
+  if (persistence_filepath)
+    free(persistence_filepath);
+  if (config && config->persistence_filepath)
+    persistence_filepath = helper_strdup(config->persistence_filepath);
+  else
+    persistence_filepath = helper_strdup(DEFAULT_PERSISTENCE_FILE);
+
+  if (config && config->scheduled_task)
+    scheduled_task = config->scheduled_task;
+  else
+    scheduled_task = NULL;
+
+  free_table(tables[0]);
+  free_table(tables[1]);
+  tables[0] = create_table(INITIAL_TABLE_SIZE);
+  tables[1] = NULL;
+  rehashing_index = -1;
+
+  // load data
+  FILE *file = fopen(persistence_filepath, "r");
+  if (file)
+  {
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = (char *)malloc(file_size + 1);
+    if (!buffer)
+      memory_error_handler(__FILE__, __LINE__, __func__);
+    fread(buffer, 1, file_size, file);
+    buffer[file_size] = '\0';
+    fclose(file);
+
+    char *key = NULL;
+    cJSON *cjson_cursor = cJSON_Parse(buffer);
+    cJSON *cjson_array_cursor = NULL;
+    free(buffer);
+
+    if (cjson_cursor)
+      cjson_cursor = cjson_cursor->child;
+
+    while (cjson_cursor)
+    {
+      key = cjson_cursor->string;
+
+      if (!key)
+      {
+        cjson_cursor = cjson_cursor->next;
+        continue;
+      }
+
+      if (cJSON_IsString(cjson_cursor))
+      {
+        db_set(key, cJSON_GetStringValue(cjson_cursor));
+      }
+
+      else if (cJSON_IsArray(cjson_cursor))
+      {
+        cjson_array_cursor = cjson_cursor->child;
+        while (cjson_array_cursor)
+        {
+          if (cJSON_IsString(cjson_array_cursor))
+            db_rpush(key, cJSON_GetStringValue(cjson_array_cursor), NULL);
+          cjson_array_cursor = cjson_array_cursor->next;
+        }
+      }
+
+      cjson_cursor = cjson_cursor->next;
+    }
+  }
+
+  // Start cron_runner thread
+  cron_is_running = true;
+  if (!cron_thread)
+  {
+    if (pthread_create(&cron_thread, NULL, (void *(*)(void *))cron_runner, NULL))
+    {
+      perror("pthread task allocation failed.\n");
+      exit(1);
+    };
+  }
+
+  pthread_mutex_unlock(global_mutex);
+}
+
+void db_stop()
+{
+  pthread_mutex_lock(global_mutex);
+
+  db_save(persistence_filepath);
+  rehashing_index = -1;
+  free_table(tables[0]);
+  free_table(tables[1]);
+
+  // Stop cron_runner thread
+  cron_is_running = false;
+  if (pthread_join(cron_thread, NULL))
+  {
+    perror("pthread task join failed.\n");
+    exit(1);
+  }
+
+  pthread_mutex_unlock(global_mutex);
+  pthread_mutex_destroy(global_mutex);
+  free(global_mutex);
+  global_mutex = NULL;
+}
+
+void db_save()
+{
+  pthread_mutex_lock(global_mutex);
+
+  cJSON *root = cJSON_CreateObject();
+  HTEntry *entry;
+  DLLNode *dllnode;
+  cJSON *cjson_list;
+
+  for (int j = 0; j < 2; j++)
+  {
+    if (!tables[j])
+      continue;
+
+    for (db_size_t i = 0; i < tables[j]->size; i++)
+    {
+      entry = tables[j]->entries[i];
+      while (entry)
+      {
+        switch (entry->type)
+        {
+        case DB_TYPE_STRING:
+          cJSON_AddStringToObject(root, entry->key, entry->value.string);
+          break;
+        case DB_TYPE_LIST:
+          cjson_list = cJSON_CreateArray();
+          cJSON_AddItemToObject(root, entry->key, cjson_list);
+          dllnode = entry->value.list->head;
+          while (dllnode)
+          {
+            cJSON_AddItemToArray(cjson_list, cJSON_CreateString(dllnode->data));
+            dllnode = dllnode->next;
+          }
+          break;
+        default:
+          break;
+        }
+        entry = entry->next;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(global_mutex);
+
+  FILE *file = fopen(persistence_filepath, "w");
+  if (!file)
+  {
+    perror("Failed to open file while saving.");
+    return;
+  }
+
+  char *json_string = cJSON_PrintUnformatted(root);
+  fputs(json_string, file);
+  fclose(file);
+  free(json_string);
+  cJSON_Delete(root);
+}
+
+void db_flushall()
+{
+  pthread_mutex_lock(global_mutex);
+
+  free_table(tables[0]);
+  free_table(tables[1]);
+  tables[0] = create_table(INITIAL_TABLE_SIZE);
+  tables[1] = NULL;
+  rehashing_index = -1;
+
+  pthread_mutex_unlock(global_mutex);
+}
+
+size_t db_dataset_memory_usage()
+{
+  pthread_mutex_lock(global_mutex);
+
+  size_t size = 2 * sizeof(HashTable *);
+  HTEntry *entry;
+  DLLNode *dllnode;
+
+  for (int j = 0; j < 2; j++)
+  {
+    if (!tables[j])
+      continue;
+    size += malloc_usable_size(tables[j]);
+    size += malloc_usable_size(tables[j]->entries);
+    for (db_size_t i = 0; i < tables[j]->size; i++)
+    {
+      entry = tables[j]->entries[i];
+      while (entry)
+      {
+        size += malloc_usable_size(entry);
+        size += malloc_usable_size(entry->key);
+        switch (entry->type)
+        {
+        case DB_TYPE_STRING:
+          size += malloc_usable_size(entry->value.string);
+          break;
+        case DB_TYPE_LIST:
+          size += malloc_usable_size(entry->value.list);
+          dllnode = entry->value.list->head;
+          while (dllnode)
+          {
+            size += malloc_usable_size(dllnode);
+            size += malloc_usable_size(dllnode->data);
+            dllnode = dllnode->next;
+          }
+          break;
+        default:
+          break;
+        }
+        entry = entry->next;
+      }
+    }
+  }
+
+  pthread_mutex_unlock(global_mutex);
+  return size;
+}
+
+static void cron_runner()
+{
+  while (cron_is_running)
+  {
+
+    pthread_mutex_lock(global_mutex);
+
+    if (recent_tasks_count < rehash_idle_threshold)
+      maintenance(recent_tasks_count > rehash_idle_threshold ? 0 : rehash_idle_threshold - recent_tasks_count);
+
+    recent_tasks_count = 0;
+
+    pthread_mutex_unlock(global_mutex);
+
+    usleep(1000000 / DEFAULT_CRON_HZ); // Run periodically
+  }
+}
+
+static void maintenance(int max_rehash_steps)
+{
+  pthread_mutex_lock(global_mutex);
+
+  if (!tables[1])
+  {
+    if (tables[0]->count > LOAD_FACTOR_EXPAND * tables[0]->size)
+    {
+      rehashing_index = tables[0]->size - 1;
+      tables[1] = create_table(tables[0]->size * 2);
+    }
+    else if (tables[0]->size > INITIAL_TABLE_SIZE && tables[0]->count < LOAD_FACTOR_SHRINK * tables[0]->size)
+    {
+      rehashing_index = tables[0]->size - 1;
+      tables[1] = create_table(tables[0]->size / 2);
+    }
+  }
+  else
+    while (max_rehash_steps-- > 0 && rehash_step())
+      ;
+
+  pthread_mutex_unlock(global_mutex);
+}
+
+static bool rehash_step()
+{
+  pthread_mutex_lock(global_mutex);
+
+  if (!tables[1])
+    return pthread_mutex_unlock(global_mutex), false; // Not rehashing
+
+  // Move entries from tables[0] to tables[1]
+  db_size_t index;
+  HTEntry *curr_entry = tables[0]->entries[rehashing_index];
+  HTEntry *next_entry;
+
+  while (curr_entry)
+  {
+    next_entry = curr_entry->next;
+    index = murmurhash2(curr_entry->key, strlen(curr_entry->key)) % tables[1]->size;
+    curr_entry->next = tables[1]->entries[index];
+    tables[1]->entries[index] = curr_entry;
+    tables[1]->count++;
+    tables[0]->count--;
+    curr_entry = next_entry;
+  }
+
+  tables[0]->entries[rehashing_index] = NULL;
+  rehashing_index--;
+
+  if (rehashing_index == (int32_t)(-1))
+  {
+    free_table(tables[0]);
+    tables[0] = tables[1];
+    tables[1] = NULL; // Clear the rehash table
+    return pthread_mutex_unlock(global_mutex), false;
+  }
+
+  return pthread_mutex_unlock(global_mutex), true;
+}
+
+static HashTable *create_table(db_size_t size)
+{
+  HashTable *table = malloc(sizeof(HashTable));
+  if (!table)
     memory_error_handler(__FILE__, __LINE__, __func__);
 
-  item->key = NULL;
-  item->json = json;
-  item->next = NULL;
-  set_item_key(item, key);
+  table->size = size;
+  table->count = 0;
+  table->entries = calloc(size, sizeof(HTEntry *));
 
-  return item;
+  if (!table->entries)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  return table;
 }
 
-DBItem static *add_item_to_hash_table(const char *key, DBItem *item)
+static void free_table(HashTable *table)
 {
-  if (item == NULL)
-    return NULL;
+  if (!table)
+    return;
+  db_size_t i;
 
-  unsigned long index = hash(key);
-  item->next = hash_table[index];
-  hash_table[index] = item;
-
-  return item;
-}
-
-DBItem static *remove_item_from_hash_table(const char *key)
-{
-  if (key == NULL)
-    return NULL;
-
-  unsigned long index = hash(key);
-  DBItem *prev = NULL;
-  DBItem *curr = hash_table[index];
-
-  while (curr != NULL)
+  HTEntry *curr_entry, *next_entry;
+  for (i = 0; i < table->size; i++)
   {
-    if (strcmp(curr->key, key) == 0)
+    curr_entry = table->entries[i];
+    next_entry = NULL;
+    while (curr_entry)
     {
-      if (prev == NULL)
-        hash_table[index] = curr->next;
+      next_entry = curr_entry->next;
+      free_entry(curr_entry);
+      curr_entry = next_entry;
+    }
+  }
+
+  free(table->entries);
+  free(table);
+}
+
+static HTEntry *create_entry(char *key, DBValueType type, void *value)
+{
+  if (!key || !value)
+    return NULL;
+
+  HTEntry *entry = (HTEntry *)malloc(sizeof(HTEntry));
+
+  if (!entry)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  entry->key = key;
+
+  switch (type)
+  {
+  case DB_TYPE_STRING:
+    entry->value.string = value;
+    break;
+  case DB_TYPE_LIST:
+    entry->value.list = value;
+    break;
+  default:
+    free(entry);
+    return NULL;
+  }
+
+  entry->type = type;
+
+  return entry;
+}
+
+static void free_entry(HTEntry *entry)
+{
+  if (!entry)
+    return;
+
+  if (entry->key)
+    free(entry->key);
+
+  if (entry->type == DB_TYPE_STRING)
+    free(entry->value.string);
+  else if (entry->type == DB_TYPE_LIST)
+    db_free_DLList(entry->value.list);
+
+  free(entry);
+}
+
+static HTEntry *get_entry(const char *key)
+{
+  if (!key)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+  recent_tasks_count++;
+  maintenance(1);
+
+  HTEntry *entry;
+
+  if (tables[1])
+  {
+    entry = tables[1]->entries[murmurhash2(key, strlen(key)) % tables[1]->size];
+    while (entry)
+    {
+      if (strcmp(entry->key, key) == 0)
+        return pthread_mutex_unlock(global_mutex), entry;
+      entry = entry->next;
+    }
+  }
+
+  entry = tables[0]->entries[murmurhash2(key, strlen(key)) % tables[0]->size];
+  while (entry)
+  {
+    if (strcmp(entry->key, key) == 0)
+      return pthread_mutex_unlock(global_mutex), entry;
+    entry = entry->next;
+  }
+
+  return pthread_mutex_unlock(global_mutex), NULL;
+}
+
+static HTEntry *add_entry(HTEntry *entry)
+{
+  if (!entry)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+  recent_tasks_count++;
+  maintenance(1);
+
+  db_size_t index;
+
+  if (tables[1])
+  {
+    index = murmurhash2(entry->key, strlen(entry->key)) % tables[1]->size;
+    entry->next = tables[1]->entries[index];
+    tables[1]->entries[index] = entry;
+    tables[1]->count++;
+    return pthread_mutex_unlock(global_mutex), entry;
+  }
+
+  index = murmurhash2(entry->key, strlen(entry->key)) % tables[0]->size;
+  entry->next = tables[0]->entries[index];
+  tables[0]->entries[index] = entry;
+  tables[0]->count++;
+  return pthread_mutex_unlock(global_mutex), entry;
+}
+
+static HTEntry *remove_entry(const char *key)
+{
+  if (!key)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+  recent_tasks_count++;
+  maintenance(1);
+
+  HTEntry *curr_entry, *prev_entry = NULL;
+  db_size_t index;
+
+  if (tables[1])
+  {
+    index = murmurhash2(key, strlen(key)) % tables[1]->size;
+    curr_entry = tables[1]->entries[index];
+    while (curr_entry)
+    {
+      if (strcmp(curr_entry->key, key) == 0)
+      {
+        if (prev_entry)
+          prev_entry->next = curr_entry->next;
+        else
+          tables[1]->entries[index] = curr_entry->next;
+        tables[1]->count--;
+        return pthread_mutex_unlock(global_mutex), curr_entry;
+      }
+      prev_entry = curr_entry;
+      curr_entry = curr_entry->next;
+    }
+  }
+
+  index = murmurhash2(key, strlen(key)) % tables[0]->size;
+  curr_entry = tables[0]->entries[index];
+  prev_entry = NULL;
+  while (curr_entry)
+  {
+    if (strcmp(curr_entry->key, key) == 0)
+    {
+      if (prev_entry)
+        prev_entry->next = curr_entry->next;
       else
-        prev->next = curr->next;
-
-      return curr;
+        tables[0]->entries[index] = curr_entry->next;
+      tables[0]->count--;
+      return pthread_mutex_unlock(global_mutex), curr_entry;
     }
-    prev = curr;
-    curr = curr->next;
+    prev_entry = curr_entry;
+    curr_entry = curr_entry->next;
   }
 
-  return NULL;
+  return pthread_mutex_unlock(global_mutex), NULL;
 }
 
-DBItem static *set_item_key(DBItem *item, const char *key)
+char *db_get(const char *key)
 {
-  if (item == NULL || key == NULL)
-    return NULL;
-
-  size_t key_length = (strlen(key) + 1) * sizeof(char);
-  item->key = (char *)realloc(item->key, key_length);
-
-  if (!item->key)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  memset(item->key, 0, key_length);
-  strcpy(item->key, key);
-
-  return item;
+  HTEntry *entry = get_entry(key);
+  if (entry && entry->type == DB_TYPE_STRING)
+    return entry->value.string; // Return the string value
+  return NULL;                  // Not found
 }
 
-bool exists(const char *key)
+bool db_set(const char *key, const char *value)
 {
-  return (key != NULL && get_item(key) != NULL);
-}
-
-DBItem *get_item(const char *key)
-{
-  if (key == NULL)
-    return NULL;
-
-  unsigned long index = hash(key);
-  pthread_mutex_lock(db_mutex);
-  DBItem *item = hash_table[index];
-
-  while (item != NULL)
+  pthread_mutex_lock(global_mutex);
+  HTEntry *entry = get_entry(key);
+  if (!entry)
   {
-    if (strcmp(item->key, key) == 0)
-    {
-      pthread_mutex_unlock(db_mutex);
-      return item;
-    }
-    item = item->next;
+    add_entry(create_entry(helper_strdup(key), DB_TYPE_STRING, helper_strdup(value)));
+    return pthread_mutex_unlock(global_mutex), true;
   }
-
-  pthread_mutex_unlock(db_mutex);
-  return NULL;
-}
-
-DBItem *set_item(const char *key, cJSON *json)
-{
-  if (key == NULL || json == NULL)
-    return NULL;
-
-  DBItem *oldItem = get_item(key);
-
-  if (oldItem != NULL)
+  pthread_mutex_unlock(global_mutex);
+  if (entry->type == DB_TYPE_STRING)
   {
-    if (oldItem->json == json)
-    {
-      return oldItem;
-    }
-    delete_item(key);
+    free(entry->value.string);                  // Free old value
+    entry->value.string = helper_strdup(value); // Update with new value
+    return true;
   }
-
-  DBItem *item = create_item_with_json(key, json);
-  pthread_mutex_lock(db_mutex);
-  add_item_to_hash_table(key, item);
-
-  pthread_mutex_unlock(db_mutex);
-  return item;
+  return false;
 }
 
-DBItem *rename_item(const char *old_key, const char *new_key)
+bool db_rename(const char *old_key, const char *new_key)
 {
-  if (old_key == NULL || new_key == NULL || !exists(old_key) || exists(new_key))
-    return NULL;
-
-  pthread_mutex_lock(db_mutex);
-  // remove item with old key
-  DBItem *item = remove_item_from_hash_table(old_key);
-
-  // add item with new key
-  add_item_to_hash_table(new_key, item);
-  pthread_mutex_unlock(db_mutex);
-
-  // rename item
-  set_item_key(item, new_key);
-
-  return item;
+  pthread_mutex_lock(global_mutex);
+  HTEntry *entry = remove_entry(old_key);
+  if (!entry)
+    return pthread_mutex_unlock(global_mutex), false;
+  free(entry->key);
+  entry->key = helper_strdup(new_key);
+  add_entry(entry);
+  return pthread_mutex_unlock(global_mutex), true;
 }
 
-// Return true if success, false if fail.
-bool delete_item(const char *key)
+bool db_del(const char *key)
 {
-  pthread_mutex_lock(db_mutex);
-  DBItem *item = remove_item_from_hash_table(key);
-  pthread_mutex_unlock(db_mutex);
-
-  if (item == NULL)
+  HTEntry *entry = remove_entry(key);
+  if (!entry)
     return false;
-
-  cJSON_Delete(item->json);
-  free(item);
-
+  free_entry(entry);
   return true;
 }
 
-// Returns the attribute Model.
-DBModel *def_model(DBModel *parent, const char *key, DBModelType type)
+static DLLNode *create_DLLNode(const char *data, DLLNode *prev, DLLNode *next)
 {
-  DBModel *model = (DBModel *)malloc(sizeof(DBModel));
-
-  if (!model)
+  DLLNode *node = malloc(sizeof(DLLNode));
+  if (!node)
     memory_error_handler(__FILE__, __LINE__, __func__);
-
-  model->key = key;
-  model->type = type;
-  model->intvalue = 0;
-  model->attributes = NULL;
-
-  if (parent == NULL)
-    return model;
-
-  parent->attributes = (DBModel **)realloc(parent->attributes, (parent->intvalue + 1) * sizeof(DBModel *));
-
-  if (!parent->attributes)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  parent->attributes[parent->intvalue] = model;
-  parent->intvalue++;
-
-  return model;
+  node->data = helper_strdup(data);
+  node->prev = prev;
+  node->next = next;
+  return node;
 }
 
-// Returns the Model with the property set.
-DBModel *def_model_attr(DBModel *model, DBModelType attr, int value)
+static DLList *create_DLList()
 {
-  DBModel *attribute = def_model(model, NULL, attr);
-  attribute->intvalue = value;
-
-  return model;
+  DLList *list = malloc(sizeof(DLList));
+  if (!list)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+  list->head = NULL;
+  list->tail = NULL;
+  list->length = 0;
+  return list;
 }
 
-DBModel *get_model_attr(DBModel *model, DBModelType type)
+static DLList *get_DLList(const char *key)
 {
-  if (model == NULL)
+  if (!key)
     return NULL;
 
-  int attributes_length = model->intvalue;
+  HTEntry *entry = get_entry(key);
 
-  if (type == DBModelAttr_ArrayTypeGetter)
-  {
-    for (int i = 0; i < attributes_length; i++)
-    {
-      if (model->attributes[i]->key == DBModel_ArrayTypeSymbol)
-        return model->attributes[i];
-    }
-  }
-  else
-  {
-    for (int i = 0; i < attributes_length; i++)
-    {
-      if (model->attributes[i]->type == type)
-        return model->attributes[i];
-    }
-  }
-
+  if (entry && entry->type == DB_TYPE_LIST)
+    return entry->value.list;
   return NULL;
 }
 
-DBKeys *get_model_keys(DBModel *model)
+static DLList *get_or_create_DLList(const char *key)
 {
-  DBKeys *keys = (DBKeys *)malloc(sizeof(DBKeys));
+  if (!key)
+    return NULL;
 
-  if (!keys)
-    memory_error_handler(__FILE__, __LINE__, __func__);
+  HTEntry *entry = get_entry(key);
 
-  keys->length = 0;
-  keys->keys = NULL;
-
-  if (model->type != DBModelType_Object)
-    return keys;
-
-  int length = model->intvalue;
-
-  keys->keys = (const char **)malloc(length * sizeof(const char *));
-
-  if (!keys->keys)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  keys->length = length;
-
-  for (int i = 0; i < length; i++)
+  if (entry)
   {
-    keys->keys[i] = model->attributes[i]->key;
+    if (entry->type == DB_TYPE_LIST)
+      return entry->value.list;
+    return NULL;
   }
 
-  return keys;
+  DLList *list = create_DLList();
+  add_entry(create_entry(helper_strdup(key), DB_TYPE_LIST, list));
+
+  return list;
 }
 
-#define GET_KEYS_CHUNK_SIZE 8
-
-DBKeys *get_cjson_keys(cJSON *json)
+static DLList *duplicate_DLList(DLList *list)
 {
-  DBKeys *keys = (DBKeys *)malloc(sizeof(DBKeys));
+  DLList *new_list = create_DLList();
+  DLLNode *curr_node = list->tail;
 
-  if (!keys)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  keys->length = 0;
-  keys->keys = NULL;
-  int count = 0;
-
-  cJSON *cursor = json->child;
-  while (cursor != NULL)
+  while (curr_node)
   {
-    count++;
-    if (keys->length < count)
-    {
-      keys->length += GET_KEYS_CHUNK_SIZE;
-      keys->keys = (const char **)realloc(keys->keys, keys->length * sizeof(const char *));
-
-      if (!keys->keys)
-        memory_error_handler(__FILE__, __LINE__, __func__);
-    }
-    keys->keys[count - 1] = cursor->string;
-    cursor = cursor->next;
+    new_list->head = create_DLLNode(curr_node->data, NULL, new_list->head);
+    if (new_list->head->next)
+      new_list->head->next->prev = new_list->head;
+    if (!new_list->tail)
+      new_list->tail = new_list->head;
+    curr_node = curr_node->prev;
   }
 
-  if (keys->length != count)
-  {
-    keys->length = count;
-    keys->keys = (const char **)realloc(keys->keys, count * sizeof(const char *));
-    if (!keys->keys)
-      memory_error_handler(__FILE__, __LINE__, __func__);
-  }
+  new_list->length = list->length;
 
-  return keys;
+  return new_list;
 }
 
-DBKeys *get_database_keys()
+void db_free_DLLNode(DLLNode *node)
 {
-  DBKeys *keys = (DBKeys *)malloc(sizeof(DBKeys));
-
-  if (!keys)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  keys->length = 0;
-  keys->keys = NULL;
-  int count = 0;
-  DBItem *cursor = NULL;
-
-  for (int i = 0; i < hash_table_size; i++)
-  {
-    cursor = hash_table[i];
-    while (cursor != NULL)
-    {
-      count++;
-      if (keys->length < count)
-      {
-        keys->length += GET_KEYS_CHUNK_SIZE;
-        keys->keys = (const char **)realloc(keys->keys, keys->length * sizeof(const char *));
-        if (!keys->keys)
-          memory_error_handler(__FILE__, __LINE__, __func__);
-      }
-      keys->keys[count - 1] = cursor->key;
-      cursor = cursor->next;
-    }
-  }
-
-  if (keys->length != count)
-  {
-    keys->length = count;
-    keys->keys = (const char **)realloc(keys->keys, count * sizeof(const char *));
-    if (!keys->keys)
-      memory_error_handler(__FILE__, __LINE__, __func__);
-  }
-
-  return keys;
-}
-
-void free_keys(DBKeys *keys)
-{
-  if (keys == NULL)
+  if (!node)
     return;
 
-  free(keys->keys);
-  free(keys);
+  DLLNode *curr_neighbour = node->prev;
+  DLLNode *next_neighbour;
+
+  while (curr_neighbour)
+  {
+    next_neighbour = curr_neighbour->prev;
+    free(curr_neighbour->data);
+    free(curr_neighbour);
+    curr_neighbour = next_neighbour;
+  }
+
+  curr_neighbour = node->next;
+  while (curr_neighbour)
+  {
+    next_neighbour = curr_neighbour->next;
+    free(curr_neighbour->data);
+    free(curr_neighbour);
+    curr_neighbour = next_neighbour;
+  }
+
+  free(node->data);
+  free(node);
 }
 
-void load_database(const char *filename, const size_t _hash_table_size)
+void db_free_DLList(DLList *list)
 {
-  // read the JSON file
-  FILE *file = fopen(filename, "r");
-  char *db_json_string = NULL;
-  size_t length = 0;
+  if (!list)
+    return;
 
-  if (file == NULL)
+  db_free_DLLNode(list->head);
+  free(list);
+}
+
+db_size_t db_lpush(const char *key, ...)
+{
+  if (!key)
+    return 0;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_or_create_DLList(key);
+
+  if (!list)
+    return pthread_mutex_unlock(global_mutex), 0;
+
+  va_list items;
+  va_start(items, key);
+
+  DLLNode *node;
+
+  char *value;
+  while ((value = (char *)va_arg(items, char *)) != NULL)
   {
-    printf("Warning: Failed to open file %s\n", filename);
+    node = create_DLLNode(value, NULL, list->head);
+    if (list->head)
+      list->head->prev = node;
+    list->head = node;
+    if (!list->tail)
+      list->tail = node;
+    list->length++;
+  }
+
+  return pthread_mutex_unlock(global_mutex), list->length;
+}
+
+DLLNode *db_lpop(const char *key, db_size_t count)
+{
+  if (!key || count == 0)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_DLList(key);
+
+  if (!list || count == 0)
+    return pthread_mutex_unlock(global_mutex), NULL;
+
+  DLLNode *head_node = list->head;
+  DLLNode *tail_node = list->head;
+
+  if (!head_node)
+    return pthread_mutex_unlock(global_mutex), NULL;
+
+  db_size_t counted = 1;
+
+  while (counted < count)
+  {
+    if (!tail_node->next)
+      break;
+    tail_node = tail_node->next;
+    counted++;
+  }
+
+  list->head = tail_node->next;
+  if (list->head)
+    list->head->prev = NULL;
+  if (list->tail == tail_node)
+    list->tail = NULL;
+  tail_node->next = NULL;
+
+  list->length -= counted;
+
+  return pthread_mutex_unlock(global_mutex), head_node;
+}
+
+db_size_t db_rpush(const char *key, ...)
+{
+  if (!key)
+    return 0;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_or_create_DLList(key);
+
+  if (!list)
+    return pthread_mutex_unlock(global_mutex), 0;
+
+  va_list items;
+  va_start(items, key);
+
+  DLLNode *node;
+
+  char *value;
+  while ((value = (char *)va_arg(items, char *)) != NULL)
+  {
+    node = create_DLLNode(value, list->tail, NULL);
+    if (list->tail)
+      list->tail->next = node;
+    list->tail = node;
+    if (!list->head)
+      list->head = node;
+    list->length++;
+  }
+
+  return pthread_mutex_unlock(global_mutex), list->length;
+}
+
+DLLNode *db_rpop(const char *key, db_size_t count)
+{
+  if (!key || count == 0)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_DLList(key);
+
+  if (!list || count == 0)
+    return pthread_mutex_unlock(global_mutex), NULL;
+
+  DLLNode *head_node = list->tail;
+  DLLNode *tail_node = list->tail;
+
+  if (!head_node)
+    return pthread_mutex_unlock(global_mutex), NULL;
+
+  db_size_t counted = 1;
+
+  while (counted < count)
+  {
+    if (!tail_node->prev)
+      break;
+    tail_node = tail_node->prev;
+    counted++;
+  }
+
+  list->tail = tail_node->prev;
+  if (list->tail)
+    list->tail->next = NULL;
+  if (list->head == tail_node)
+    list->head = NULL;
+  tail_node->prev = NULL;
+
+  list->length -= counted;
+
+  return pthread_mutex_unlock(global_mutex), head_node;
+}
+
+db_size_t db_llen(const char *key)
+{
+  if (!key)
+    return 0;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_DLList(key);
+
+  if (!list)
+    return pthread_mutex_unlock(global_mutex), 0;
+
+  db_size_t length = list->length;
+
+  return pthread_mutex_unlock(global_mutex), length;
+}
+
+DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
+{
+  if (!key)
+    return NULL;
+
+  pthread_mutex_lock(global_mutex);
+
+  DLList *list = get_DLList(key);
+
+  if (!list || list->length == 0)
+    return pthread_mutex_unlock(global_mutex), NULL;
+
+  if (stop == DB_SIZE_MAX || stop > list->length - 1)
+    stop = list->length - 1;
+
+  if (start > stop)
+    start = 0;
+
+  printf("%lu %lu\n", start, stop);
+
+  if (start == 0 && stop == list->length - 1)
+    return pthread_mutex_unlock(global_mutex), duplicate_DLList(list);
+
+  DLList *new_list = create_DLList();
+  DLLNode *new_node = NULL;
+  DLLNode *curr_node;
+  db_size_t index;
+
+  if (start > list->length - 1 - stop)
+  {
+    curr_node = list->tail;
+    index = list->length - 1;
+    while (index != stop && curr_node)
+    {
+      curr_node = curr_node->prev;
+      index--;
+    }
+    while (index >= start && curr_node)
+    {
+      new_node = create_DLLNode(curr_node->data, NULL, new_node);
+      if (!new_list->tail)
+        new_list->tail = new_node;
+      if (new_node->next)
+        new_node->next->prev = new_node;
+      curr_node = curr_node->prev;
+      index--;
+    }
+    new_list->head = new_node;
   }
   else
   {
-    fseek(file, 0, SEEK_END);
-    length = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    db_json_string = (char *)calloc((length + 1), sizeof(char));
-    if (!db_json_string)
-      memory_error_handler(__FILE__, __LINE__, __func__);
-    fread(db_json_string, 1, length, file);
-    fclose(file);
-    // prevent memory leak
-    db_json_string[length] = '\0';
-  }
-
-  // clear table if table is not NULL
-  if (hash_table != NULL)
-  {
-    DBItem *item = NULL;
-    DBItem *next = NULL;
-    for (int i = 0; i < hash_table_size; i++)
+    curr_node = list->head;
+    index = 0;
+    while (index != start && curr_node)
     {
-      item = hash_table[i];
-      while (item != NULL)
-      {
-        next = item->next;
-        free(item->key);
-        free(item);
-        item = next;
-      }
+      curr_node = curr_node->next;
+      index++;
     }
-    free(hash_table);
-    hash_table = NULL;
-  }
-
-  // create hash table
-  hash_table_size = _hash_table_size;
-  hash_table = (DBItem **)calloc(hash_table_size, sizeof(DBItem *));
-
-  if (!hash_table)
-    memory_error_handler(__FILE__, __LINE__, __func__);
-
-  // create json root
-  cJSON *json_root = NULL;
-  if (db_json_string)
-  {
-    json_root = cJSON_Parse(db_json_string);
-    free(db_json_string);
-  }
-  if (json_root == NULL)
-    json_root = cJSON_CreateObject();
-
-  // load items
-  cJSON *json_cursor = json_root->child;
-  DBItem *item = NULL;
-
-  pthread_mutex_lock(db_mutex);
-  while (json_cursor != NULL)
-  {
-    item = create_item_with_json(json_cursor->string, cJSON_Duplicate(json_cursor, true));
-    add_item_to_hash_table(json_cursor->string, item);
-    json_cursor = json_cursor->next;
-  }
-  pthread_mutex_unlock(db_mutex);
-
-  cJSON_Delete(json_root);
-}
-
-void save_database(const char *filename)
-{
-  FILE *file = fopen(filename, "w");
-  if (file == NULL)
-    return;
-
-  cJSON *json_root = cJSON_CreateObject();
-
-  pthread_mutex_lock(db_mutex);
-
-  // iter hash table and get items, then set to json root
-  DBItem *item = NULL;
-  for (int i = 0; i < hash_table_size; i++)
-  {
-    item = hash_table[i];
-    while (item != NULL)
+    while (index <= stop && curr_node)
     {
-      cJSON_AddItemReferenceToObject(json_root, item->key, item->json);
-      item = item->next;
+      new_node = create_DLLNode(curr_node->data, new_node, NULL);
+      if (!new_list->head)
+        new_list->head = new_node;
+      if (new_node->prev)
+        new_node->prev->next = new_node;
+      curr_node = curr_node->next;
+      index++;
     }
+    new_list->tail = new_node;
   }
-  pthread_mutex_unlock(db_mutex);
 
-  char *data = cJSON_Print(json_root);
-  cJSON_Delete(json_root);
-  if (data)
-  {
-    fprintf(file, "%s", data);
-    free(data);
-  }
-  fclose(file);
+  new_list->length = stop - start + 1;
+
+  return pthread_mutex_unlock(global_mutex), new_list;
 }

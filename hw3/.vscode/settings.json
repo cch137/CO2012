@@ -4,7 +4,7 @@
   "files.associations": {
     "*.ejs": "html",
     "typeinfo": "c",
-    "cjson.h": "c",
+    "deps/cJSON.h": "c",
     "stdbool.h": "c",
     "database.h": "c",
     "interface.h": "c",
