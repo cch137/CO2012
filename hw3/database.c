@@ -1,8 +1,8 @@
 #include <string.h>
 #include <time.h>
-#include <stdarg.h>
 #include <malloc.h>
 #include <unistd.h>
+#include <threads.h>
 
 #include "deps/cJSON.h"
 #include "utils.h"
@@ -18,19 +18,153 @@
 #define LOAD_FACTOR_SHRINK 0.1
 
 #define DEFAULT_CRON_HZ 10
-#define DEFAULT_REHASH_IDLE_THRESHOLD 10000
 #define DEFAULT_PERSISTENCE_FILE "db.json"
 
+#define NANOSECONDS_PER_SECOND 1000000000L
+#define TIMEOUT_SEC 0.1F
+
+#define DB_ERR_DB_IS_CLOSED "Database is closed"
+#define DB_ERR_ARG_ERROR "Argument error"
+#define DB_ERR_UNKNOWN_COMMAND "Unknown command"
+
+typedef struct HTEntry
+{
+  // Key for the entry
+  char *key;
+  // Type of the stored value (e.g., string or list)
+  db_type_t type;
+  // Value for the entry
+  union DBValue
+  {
+    char *string;
+    DLList *list;
+  } value;
+  // Pointer to the next entry in case of a hash collision
+  struct HTEntry *next;
+} HTEntry;
+
+typedef struct HashTable
+{
+  // Number of slots in the hash table
+  db_uint_t size;
+  // Current number of entries in the hash table
+  db_uint_t count;
+  // Array of entries
+  HTEntry **entries;
+} HashTable;
+
+typedef struct RequestEntry
+{
+  clock_t created_at;
+  DBRequest *request;
+  DBReply *reply;
+  struct RequestEntry *next;
+  bool done;
+} RequestEntry;
+
+// Computes the MurmurHash2 hash of a key
+static db_uint_t murmurhash2(const void *key, db_uint_t len);
+
+// Returns the memory usage of the current database dataset
+static size_t get_dataset_memory_usage();
+
+static int main_thread();
+
+// Executes periodic tasks, including checking if rehashing should start
+// Resets recent_tasks_count after each execution
+static int cron_thread();
+
+// Executed during each low-level operation and periodic task to maintain the hash table size
+static void maintenance();
+
+// Checks if rehashing is needed and performs a rehash step if required
+// Returns true if additional rehash steps are required
+static bool rehash_step();
+
+// Creates a new hash table with the specified size
+static HashTable *create_table(db_uint_t size);
+
+// Frees the memory allocated for a hash table
+static void free_table(HashTable *table);
+
+// Creates a new entry with the specified key and type; assigns value directly
+static HTEntry *create_entry(char *key, db_type_t type, void *value);
+
+// Frees the memory allocated for a hash table entry
+static void free_entry(HTEntry *entry);
+
+// Retrieves an entry by key; returns NULL if not found
+static HTEntry *get_entry(const char *key);
+
+// Adds an entry to the hash table
+static HTEntry *add_entry(HTEntry *entry);
+
+// Removes an entry by key; returns NULL if not found
+static HTEntry *remove_entry(const char *key);
+
+// Creates a new node for a doubly linked list with specified data
+static DLNode *create_dlnode(const char *data, DLNode *prev, DLNode *next);
+
+// Initializes a new, empty doubly linked list
+static DLList *create_dllist();
+
+// Retrieves a list by key; returns NULL if not found
+static DLList *get_dllist(const char *key);
+
+// Retrieves a list by key or creates a new one if it does not exist
+static DLList *get_or_create_dllist(const char *key);
+
+// Frees a list node and all its sibling nodes
+static void free_dlnode_chain(DLNode *node);
+
+// Frees an entire list and all of its nodes
+static void free_dllist(DLList *list);
+
+// Retrieves a string from the database by key; returns NULL if not found or type mismatch
+static char *db_get(const char *key);
+
+// Stores a string in the database with the specified key and value
+// Updates the value if the key exists, otherwise creates a new entry
+// Returns true if successful, false if type mismatch
+static bool db_set(const char *key, const char *value);
+
+// Renames an existing key to a new key in the database
+// Removes the old entry and inserts the new one with the updated key
+// Returns true if successful, false if type mismatch
+static bool db_rename(const char *old_key, const char *new_key);
+
+// Deletes an entry by key; Returns the number of successfully deleted keys
+static db_uint_t db_del(DBArg *arg);
+
+// Pushes elements to the front of a list; last parameter must be NULL
+static db_uint_t db_lpush(const char *key, DBArg *arg);
+
+// Pops elements from the front of a list
+static DLList *db_lpop(const char *key, db_uint_t count);
+
+// Pushes elements to the end of a list; last parameter must be NULL
+static db_uint_t db_rpush(const char *key, DBArg *arg);
+
+// Pops elements from the end of a list
+static DLList *db_rpop(const char *key, db_uint_t count);
+
+// Returns the number of nodes in a list
+static db_uint_t db_llen(const char *key);
+
+// Returns a sublist from the specified range of indices
+// The `stop` index is inclusive, and if `stop` is -1, the entire list is returned
+static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop);
+
+const static clock_t TIMEOUT_CLOCK = (clock_t)CLOCKS_PER_SEC * TIMEOUT_SEC;
+
 // Seed for the hash function, affecting hash distribution
-static db_size_t hash_seed = 0;
-// Threshold of idle tasks before rehashing starts
-static db_size_t rehash_idle_threshold = DEFAULT_REHASH_IDLE_THRESHOLD;
+static db_uint_t hash_seed = 0;
 // Frequency of periodic task execution per second
 static uint8_t cron_hz = DEFAULT_CRON_HZ;
+static long int cron_sleep_ns = -1;
+
 // File path for database persistence
 static char *persistence_filepath = NULL;
-// Task function to run periodically at a rate set by cron_hz
-static void (*scheduled_task)() = NULL;
 
 // tables[0] is the main table, tables[1] is the rehash table
 // During rehashing, entries are first searched and deleted from tables[1], then from tables[0].
@@ -41,26 +175,26 @@ static HashTable *tables[2] = {NULL, NULL};
 // -1 indicates no rehashing; otherwise, it's the current rehashing index
 // The occurrence of rehashing is determined by periodic tasks; when rehashing starts, rehashing_index will be the last index of the table size
 // Rehashing will be handled during periodic task execution and during db_insert_entry and db_get_entry.
-static db_count_t rehashing_index = -1;
+static db_int_t rehashing_index = -1;
 
-// Records the count of recent tasks
-static db_size_t recent_tasks_count = 0;
+static bool is_running = false;
+static mtx_t *lock = NULL;
+static thrd_t worker = -1;
 
-static pthread_mutex_t *global_mutex = NULL;
-static pthread_t cron_thread;
-static bool cron_is_running = false;
+static RequestEntry *request_queue_head;
+static RequestEntry *request_queue_tail;
 
-static db_size_t murmurhash2(const void *key, db_size_t len)
+static db_uint_t murmurhash2(const void *key, db_uint_t len)
 {
-  const db_size_t m = 0x5bd1e995;
+  const db_uint_t m = 0x5bd1e995;
   const int r = 24;
-  db_size_t h = hash_seed ^ len;
+  db_uint_t h = hash_seed ^ len;
 
   const unsigned char *data = (const unsigned char *)key;
 
   while (len >= 4)
   {
-    db_size_t k = *(db_size_t *)data;
+    db_uint_t k = *(db_uint_t *)data;
     k *= m, k ^= k >> r, k *= m;
     h *= m, h ^= k;
     data += 4, len -= 4;
@@ -82,228 +216,8 @@ static db_size_t murmurhash2(const void *key, db_size_t len)
   return h;
 }
 
-static pthread_mutex_t *init_pthread_mutex(pthread_mutex_t *mutex)
+static size_t get_dataset_memory_usage()
 {
-  if (!mutex)
-  {
-    mutex = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
-    if (!mutex)
-      memory_error_handler(__FILE__, __LINE__, __func__);
-    pthread_mutex_init(mutex, NULL);
-  }
-  pthread_mutexattr_t attr;
-  pthread_mutexattr_init(&attr);
-  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE_NP);
-  pthread_mutex_init(mutex, &attr);
-  pthread_mutexattr_destroy(&attr);
-  return mutex;
-}
-
-void db_start(DBConfig *config)
-{
-  if (!global_mutex)
-    global_mutex = init_pthread_mutex(NULL);
-
-  pthread_mutex_lock(global_mutex);
-
-  if (config && config->hash_seed)
-    hash_seed = config->hash_seed;
-  else
-    hash_seed = (db_size_t)time(NULL);
-
-  if (config && config->rehash_idle_threshold)
-    rehash_idle_threshold = config->rehash_idle_threshold;
-  else
-    rehash_idle_threshold = DEFAULT_REHASH_IDLE_THRESHOLD;
-
-  if (config && config->cron_hz)
-    cron_hz = config->cron_hz;
-  else
-    cron_hz = DEFAULT_CRON_HZ;
-
-  if (persistence_filepath)
-    free(persistence_filepath);
-  if (config && config->persistence_filepath)
-    persistence_filepath = helper_strdup(config->persistence_filepath);
-  else
-    persistence_filepath = helper_strdup(DEFAULT_PERSISTENCE_FILE);
-
-  if (config && config->scheduled_task)
-    scheduled_task = config->scheduled_task;
-  else
-    scheduled_task = NULL;
-
-  free_table(tables[0]);
-  free_table(tables[1]);
-  tables[0] = create_table(INITIAL_TABLE_SIZE);
-  tables[1] = NULL;
-  rehashing_index = -1;
-
-  // load data
-  FILE *file = fopen(persistence_filepath, "r");
-  if (file)
-  {
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    char *buffer = (char *)malloc(file_size + 1);
-    if (!buffer)
-      memory_error_handler(__FILE__, __LINE__, __func__);
-    fread(buffer, 1, file_size, file);
-    buffer[file_size] = '\0';
-    fclose(file);
-
-    char *key = NULL;
-    cJSON *cjson_cursor = cJSON_Parse(buffer);
-    cJSON *cjson_array_cursor = NULL;
-    free(buffer);
-
-    if (cjson_cursor)
-      cjson_cursor = cjson_cursor->child;
-
-    while (cjson_cursor)
-    {
-      key = cjson_cursor->string;
-
-      if (!key)
-      {
-        cjson_cursor = cjson_cursor->next;
-        continue;
-      }
-
-      if (cJSON_IsString(cjson_cursor))
-      {
-        db_set(key, cJSON_GetStringValue(cjson_cursor));
-      }
-
-      else if (cJSON_IsArray(cjson_cursor))
-      {
-        cjson_array_cursor = cjson_cursor->child;
-        while (cjson_array_cursor)
-        {
-          if (cJSON_IsString(cjson_array_cursor))
-            db_rpush(key, cJSON_GetStringValue(cjson_array_cursor), NULL);
-          cjson_array_cursor = cjson_array_cursor->next;
-        }
-      }
-
-      cjson_cursor = cjson_cursor->next;
-    }
-  }
-
-  // Start cron_runner thread
-  cron_is_running = true;
-  if (!cron_thread)
-  {
-    if (pthread_create(&cron_thread, NULL, (void *(*)(void *))cron_runner, NULL))
-    {
-      perror("pthread task allocation failed.\n");
-      exit(1);
-    };
-  }
-
-  pthread_mutex_unlock(global_mutex);
-}
-
-void db_stop()
-{
-  pthread_mutex_lock(global_mutex);
-
-  db_save(persistence_filepath);
-  rehashing_index = -1;
-  free_table(tables[0]);
-  free_table(tables[1]);
-
-  // Stop cron_runner thread
-  cron_is_running = false;
-  if (pthread_join(cron_thread, NULL))
-  {
-    perror("pthread task join failed.\n");
-    exit(1);
-  }
-
-  pthread_mutex_unlock(global_mutex);
-  pthread_mutex_destroy(global_mutex);
-  free(global_mutex);
-  global_mutex = NULL;
-}
-
-void db_save()
-{
-  pthread_mutex_lock(global_mutex);
-
-  cJSON *root = cJSON_CreateObject();
-  HTEntry *entry;
-  DLNode *dllnode;
-  cJSON *cjson_list;
-
-  for (int j = 0; j < 2; j++)
-  {
-    if (!tables[j])
-      continue;
-
-    for (db_size_t i = 0; i < tables[j]->size; i++)
-    {
-      entry = tables[j]->entries[i];
-      while (entry)
-      {
-        switch (entry->type)
-        {
-        case DB_TYPE_STRING:
-          cJSON_AddStringToObject(root, entry->key, entry->value.string);
-          break;
-        case DB_TYPE_LIST:
-          cjson_list = cJSON_CreateArray();
-          cJSON_AddItemToObject(root, entry->key, cjson_list);
-          dllnode = entry->value.list->head;
-          while (dllnode)
-          {
-            cJSON_AddItemToArray(cjson_list, cJSON_CreateString(dllnode->data));
-            dllnode = dllnode->next;
-          }
-          break;
-        default:
-          break;
-        }
-        entry = entry->next;
-      }
-    }
-  }
-
-  pthread_mutex_unlock(global_mutex);
-
-  FILE *file = fopen(persistence_filepath, "w");
-  if (!file)
-  {
-    perror("Failed to open file while saving.");
-    return;
-  }
-
-  char *json_string = cJSON_PrintUnformatted(root);
-  fputs(json_string, file);
-  fclose(file);
-  free(json_string);
-  cJSON_Delete(root);
-}
-
-void db_flushall()
-{
-  pthread_mutex_lock(global_mutex);
-
-  free_table(tables[0]);
-  free_table(tables[1]);
-  tables[0] = create_table(INITIAL_TABLE_SIZE);
-  tables[1] = NULL;
-  rehashing_index = -1;
-
-  pthread_mutex_unlock(global_mutex);
-}
-
-size_t db_dataset_memory_usage()
-{
-  pthread_mutex_lock(global_mutex);
-
   size_t size = 2 * sizeof(HashTable *);
   HTEntry *entry;
   DLNode *dllnode;
@@ -314,7 +228,7 @@ size_t db_dataset_memory_usage()
       continue;
     size += malloc_usable_size(tables[j]);
     size += malloc_usable_size(tables[j]->entries);
-    for (db_size_t i = 0; i < tables[j]->size; i++)
+    for (db_uint_t i = 0; i < tables[j]->size; i++)
     {
       entry = tables[j]->entries[i];
       while (entry)
@@ -344,32 +258,238 @@ size_t db_dataset_memory_usage()
     }
   }
 
-  pthread_mutex_unlock(global_mutex);
   return size;
 }
 
-static void cron_runner()
+static int main_thread()
 {
-  while (cron_is_running)
+  clock_t t0;
+  thrd_t cron_worker;
+  DBRequest *request;
+  DBReply *reply;
+  DBArg *arg1, *arg2, *arg3;
+
+  thrd_create(&cron_worker, cron_thread, NULL);
+
+  while (is_running)
   {
-
-    pthread_mutex_lock(global_mutex);
-
-    if (recent_tasks_count < rehash_idle_threshold)
-      maintenance(recent_tasks_count > rehash_idle_threshold ? 0 : rehash_idle_threshold - recent_tasks_count);
-
-    recent_tasks_count = 0;
-
-    pthread_mutex_unlock(global_mutex);
-
-    usleep(1000000 / DEFAULT_CRON_HZ); // Run periodically
+    if (mtx_trylock(lock) != thrd_success)
+      continue;
+    maintenance();
+    while (request_queue_head)
+    {
+      request = request_queue_head->request;
+      reply = request_queue_head->reply;
+      reply->ok = true;
+      switch (request->action)
+      {
+      case DB_GET:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_STRING;
+        reply->value.string = db_get(arg1->value.string);
+        break;
+      case DB_SET:
+        arg1 = request->arg_head;
+        arg2 = arg1->next;
+        if (!arg1 || arg1->type != DB_TYPE_STRING || !arg2 || arg2->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_BOOL;
+        reply->value.boolean = db_set(arg1->value.string, arg2->value.string);
+        break;
+      case DB_RENAME:
+        arg1 = request->arg_head;
+        arg2 = arg1->next;
+        if (!arg1 || arg1->type != DB_TYPE_STRING || !arg2 || arg2->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_BOOL;
+        reply->value.boolean = db_rename(arg1->value.string, arg2->value.string);
+        break;
+      case DB_DEL:
+        reply->type = DB_TYPE_UINT;
+        reply->value.unsigned_int = db_del(request->arg_head);
+        break;
+      case DB_LPUSH:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        arg2 = arg1->next;
+        reply->type = DB_TYPE_UINT;
+        reply->value.unsigned_int = db_lpush(arg1->value.string, arg1->next);
+        break;
+      case DB_LPOP:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        arg2 = arg1->next;
+        if (!arg2)
+          arg2 = db_add_arg_uint(request, 1);
+        else if (arg2->type == DB_TYPE_INT)
+        {
+          arg2->type = DB_TYPE_UINT;
+          arg2->value.unsigned_int = arg2->value.signed_int;
+        }
+        if (arg2->type != DB_TYPE_UINT)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_LIST;
+        reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
+        break;
+      case DB_RPUSH:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        arg2 = arg1->next;
+        reply->type = DB_TYPE_UINT;
+        reply->value.unsigned_int = db_rpush(arg1->value.string, arg2);
+        break;
+      case DB_RPOP:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        arg2 = arg1->next;
+        if (!arg2)
+          arg2 = db_add_arg_uint(request, 1);
+        else if (arg2->type == DB_TYPE_INT)
+        {
+          arg2->type = DB_TYPE_UINT;
+          arg2->value.unsigned_int = arg2->value.signed_int;
+        }
+        if (arg2->type != DB_TYPE_UINT)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_LIST;
+        reply->value.list = db_rpop(arg1->value.string, arg2->value.unsigned_int);
+        break;
+      case DB_LLEN:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_UINT;
+        reply->value.unsigned_int = db_llen(arg1->value.string);
+        break;
+      case DB_LRANGE:
+        arg1 = request->arg_head;
+        if (!arg1 || arg1->type != DB_TYPE_STRING)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        arg2 = arg1->next;
+        arg3 = arg2 ? arg2->next : NULL;
+        if (arg2 && arg2->type == DB_TYPE_INT)
+        {
+          arg2->type = DB_TYPE_UINT;
+          arg2->value.unsigned_int = arg2->value.signed_int;
+        }
+        if (arg3 && arg3->type == DB_TYPE_INT)
+        {
+          arg3->type = DB_TYPE_UINT;
+          arg3->value.unsigned_int = arg3->value.signed_int;
+        }
+        if (!arg2 || arg2->type != DB_TYPE_UINT || !arg3 || arg3->type != DB_TYPE_UINT)
+        {
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
+          break;
+        }
+        reply->type = DB_TYPE_LIST;
+        reply->value.list = db_lrange(arg1->value.string, arg2->value.unsigned_int, arg3->value.unsigned_int);
+        break;
+      case DB_FLUSHALL:
+        db_flushall();
+        reply->type = DB_TYPE_BOOL;
+        reply->value.boolean = true;
+        break;
+      case DB_INFO_DATASET_MEMORY:
+        reply->type = DB_TYPE_UINT;
+        reply->value.unsigned_int = get_dataset_memory_usage();
+        break;
+      default:
+        reply->ok = false;
+        reply->type = DB_TYPE_ERROR;
+        reply->value.string = helper_strdup(DB_ERR_UNKNOWN_COMMAND);
+        break;
+      }
+      request_queue_head->done = true;
+      request_queue_head = request_queue_head->next;
+      if (!request_queue_head)
+        request_queue_tail = NULL;
+    }
+    mtx_unlock(lock);
   }
+
+  thrd_join(cron_worker, NULL);
+
+  return 0;
 }
 
-static void maintenance(int max_rehash_steps)
+static int cron_thread()
 {
-  pthread_mutex_lock(global_mutex);
+  while (is_running)
+  {
+    mtx_lock(lock);
+    // TODO: scheduled task
+    mtx_unlock(lock);
+    thrd_sleep(&(struct timespec){.tv_sec = 0, .tv_nsec = cron_sleep_ns}, NULL);
+  }
+  return 0;
+}
 
+static void maintenance()
+{
   if (!tables[1])
   {
     if (tables[0]->count > LOAD_FACTOR_EXPAND * tables[0]->size)
@@ -384,21 +504,16 @@ static void maintenance(int max_rehash_steps)
     }
   }
   else
-    while (max_rehash_steps-- > 0 && rehash_step())
-      ;
-
-  pthread_mutex_unlock(global_mutex);
+    rehash_step();
 }
 
 static bool rehash_step()
 {
-  pthread_mutex_lock(global_mutex);
-
   if (!tables[1])
-    return pthread_mutex_unlock(global_mutex), false; // Not rehashing
+    return false; // Not rehashing
 
   // Move entries from tables[0] to tables[1]
-  db_size_t index;
+  db_uint_t index;
   HTEntry *curr_entry = tables[0]->entries[rehashing_index];
   HTEntry *next_entry;
 
@@ -421,13 +536,13 @@ static bool rehash_step()
     free_table(tables[0]);
     tables[0] = tables[1];
     tables[1] = NULL; // Clear the rehash table
-    return pthread_mutex_unlock(global_mutex), false;
+    return false;
   }
 
-  return pthread_mutex_unlock(global_mutex), true;
+  return true;
 }
 
-static HashTable *create_table(db_size_t size)
+static HashTable *create_table(db_uint_t size)
 {
   HashTable *table = malloc(sizeof(HashTable));
   if (!table)
@@ -447,7 +562,7 @@ static void free_table(HashTable *table)
 {
   if (!table)
     return;
-  db_size_t i;
+  db_uint_t i;
 
   HTEntry *curr_entry, *next_entry;
   for (i = 0; i < table->size; i++)
@@ -466,7 +581,7 @@ static void free_table(HashTable *table)
   free(table);
 }
 
-static HTEntry *create_entry(char *key, DBValueType type, void *value)
+static HTEntry *create_entry(char *key, db_type_t type, void *value)
 {
   if (!key || !value)
     return NULL;
@@ -507,7 +622,7 @@ static void free_entry(HTEntry *entry)
   if (entry->type == DB_TYPE_STRING)
     free(entry->value.string);
   else if (entry->type == DB_TYPE_LIST)
-    db_free_DLList(entry->value.list);
+    free_dllist(entry->value.list);
 
   free(entry);
 }
@@ -517,10 +632,6 @@ static HTEntry *get_entry(const char *key)
   if (!key)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
-  recent_tasks_count++;
-  maintenance(1);
-
   HTEntry *entry;
 
   if (tables[1])
@@ -529,7 +640,7 @@ static HTEntry *get_entry(const char *key)
     while (entry)
     {
       if (strcmp(entry->key, key) == 0)
-        return pthread_mutex_unlock(global_mutex), entry;
+        return entry;
       entry = entry->next;
     }
   }
@@ -538,11 +649,11 @@ static HTEntry *get_entry(const char *key)
   while (entry)
   {
     if (strcmp(entry->key, key) == 0)
-      return pthread_mutex_unlock(global_mutex), entry;
+      return entry;
     entry = entry->next;
   }
 
-  return pthread_mutex_unlock(global_mutex), NULL;
+  return NULL;
 }
 
 static HTEntry *add_entry(HTEntry *entry)
@@ -550,11 +661,7 @@ static HTEntry *add_entry(HTEntry *entry)
   if (!entry)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
-  recent_tasks_count++;
-  maintenance(1);
-
-  db_size_t index;
+  db_uint_t index;
 
   if (tables[1])
   {
@@ -562,14 +669,14 @@ static HTEntry *add_entry(HTEntry *entry)
     entry->next = tables[1]->entries[index];
     tables[1]->entries[index] = entry;
     tables[1]->count++;
-    return pthread_mutex_unlock(global_mutex), entry;
+    return entry;
   }
 
   index = murmurhash2(entry->key, strlen(entry->key)) % tables[0]->size;
   entry->next = tables[0]->entries[index];
   tables[0]->entries[index] = entry;
   tables[0]->count++;
-  return pthread_mutex_unlock(global_mutex), entry;
+  return entry;
 }
 
 static HTEntry *remove_entry(const char *key)
@@ -577,12 +684,8 @@ static HTEntry *remove_entry(const char *key)
   if (!key)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
-  recent_tasks_count++;
-  maintenance(1);
-
   HTEntry *curr_entry, *prev_entry = NULL;
-  db_size_t index;
+  db_uint_t index;
 
   if (tables[1])
   {
@@ -597,7 +700,7 @@ static HTEntry *remove_entry(const char *key)
         else
           tables[1]->entries[index] = curr_entry->next;
         tables[1]->count--;
-        return pthread_mutex_unlock(global_mutex), curr_entry;
+        return curr_entry;
       }
       prev_entry = curr_entry;
       curr_entry = curr_entry->next;
@@ -616,64 +719,16 @@ static HTEntry *remove_entry(const char *key)
       else
         tables[0]->entries[index] = curr_entry->next;
       tables[0]->count--;
-      return pthread_mutex_unlock(global_mutex), curr_entry;
+      return curr_entry;
     }
     prev_entry = curr_entry;
     curr_entry = curr_entry->next;
   }
 
-  return pthread_mutex_unlock(global_mutex), NULL;
+  return NULL;
 }
 
-char *db_get(const char *key)
-{
-  HTEntry *entry = get_entry(key);
-  if (entry && entry->type == DB_TYPE_STRING)
-    return entry->value.string; // Return the string value
-  return NULL;                  // Not found
-}
-
-bool db_set(const char *key, const char *value)
-{
-  pthread_mutex_lock(global_mutex);
-  HTEntry *entry = get_entry(key);
-  if (!entry)
-  {
-    add_entry(create_entry(helper_strdup(key), DB_TYPE_STRING, helper_strdup(value)));
-    return pthread_mutex_unlock(global_mutex), true;
-  }
-  pthread_mutex_unlock(global_mutex);
-  if (entry->type == DB_TYPE_STRING)
-  {
-    free(entry->value.string);                  // Free old value
-    entry->value.string = helper_strdup(value); // Update with new value
-    return true;
-  }
-  return false;
-}
-
-bool db_rename(const char *old_key, const char *new_key)
-{
-  pthread_mutex_lock(global_mutex);
-  HTEntry *entry = remove_entry(old_key);
-  if (!entry)
-    return pthread_mutex_unlock(global_mutex), false;
-  free(entry->key);
-  entry->key = helper_strdup(new_key);
-  add_entry(entry);
-  return pthread_mutex_unlock(global_mutex), true;
-}
-
-bool db_del(const char *key)
-{
-  HTEntry *entry = remove_entry(key);
-  if (!entry)
-    return false;
-  free_entry(entry);
-  return true;
-}
-
-static DLNode *create_DLNode(const char *data, DLNode *prev, DLNode *next)
+static DLNode *create_dlnode(const char *data, DLNode *prev, DLNode *next)
 {
   DLNode *node = malloc(sizeof(DLNode));
   if (!node)
@@ -684,7 +739,7 @@ static DLNode *create_DLNode(const char *data, DLNode *prev, DLNode *next)
   return node;
 }
 
-static DLList *create_DLList()
+static DLList *create_dllist()
 {
   DLList *list = malloc(sizeof(DLList));
   if (!list)
@@ -695,7 +750,7 @@ static DLList *create_DLList()
   return list;
 }
 
-static DLList *get_DLList(const char *key)
+static DLList *get_dllist(const char *key)
 {
   if (!key)
     return NULL;
@@ -707,7 +762,7 @@ static DLList *get_DLList(const char *key)
   return NULL;
 }
 
-static DLList *get_or_create_DLList(const char *key)
+static DLList *get_or_create_dllist(const char *key)
 {
   if (!key)
     return NULL;
@@ -721,33 +776,13 @@ static DLList *get_or_create_DLList(const char *key)
     return NULL;
   }
 
-  DLList *list = create_DLList();
+  DLList *list = create_dllist();
   add_entry(create_entry(helper_strdup(key), DB_TYPE_LIST, list));
 
   return list;
 }
 
-static DLList *duplicate_DLList(DLList *list)
-{
-  DLList *new_list = create_DLList();
-  DLNode *curr_node = list->tail;
-
-  while (curr_node)
-  {
-    new_list->head = create_DLNode(curr_node->data, NULL, new_list->head);
-    if (new_list->head->next)
-      new_list->head->next->prev = new_list->head;
-    if (!new_list->tail)
-      new_list->tail = new_list->head;
-    curr_node = curr_node->prev;
-  }
-
-  new_list->length = list->length;
-
-  return new_list;
-}
-
-void db_free_DLNode(DLNode *node)
+static void free_dlnode_chain(DLNode *node)
 {
   if (!node)
     return;
@@ -776,187 +811,209 @@ void db_free_DLNode(DLNode *node)
   free(node);
 }
 
-void db_free_DLList(DLList *list)
+static void free_dllist(DLList *list)
 {
   if (!list)
     return;
 
-  db_free_DLNode(list->head);
+  free_dlnode_chain(list->head);
   free(list);
 }
 
-db_size_t db_lpush(const char *key, ...)
+static char *db_get(const char *key)
+{
+  HTEntry *entry = get_entry(key);
+  if (entry && entry->type == DB_TYPE_STRING)
+    return helper_strdup(entry->value.string); // Return the string value
+  return NULL;                                 // Not found
+}
+
+static bool db_set(const char *key, const char *value)
+{
+  HTEntry *entry = get_entry(key);
+  if (!entry)
+  {
+    add_entry(create_entry(helper_strdup(key), DB_TYPE_STRING, helper_strdup(value)));
+    return true;
+  }
+  if (entry->type == DB_TYPE_STRING)
+  {
+    free(entry->value.string);                  // Free old value
+    entry->value.string = helper_strdup(value); // Update with new value
+    return true;
+  }
+  return false;
+}
+
+static bool db_rename(const char *old_key, const char *new_key)
+{
+  HTEntry *entry = remove_entry(old_key);
+  if (!entry)
+    return false;
+  free(entry->key);
+  entry->key = helper_strdup(new_key);
+  add_entry(entry);
+  return true;
+}
+
+static db_uint_t db_del(DBArg *arg)
+{
+  HTEntry *entry;
+  db_uint_t deleted_count = 0;
+
+  while (arg && arg->type == DB_TYPE_STRING)
+  {
+    entry = remove_entry(arg->value.string);
+    if (entry)
+      free_entry(entry), deleted_count++;
+    arg = arg->next;
+  }
+
+  return deleted_count;
+}
+
+static db_uint_t db_lpush(const char *key, DBArg *arg)
 {
   if (!key)
     return 0;
 
-  pthread_mutex_lock(global_mutex);
-
-  DLList *list = get_or_create_DLList(key);
+  DLList *list = get_or_create_dllist(key);
 
   if (!list)
-    return pthread_mutex_unlock(global_mutex), 0;
-
-  va_list items;
-  va_start(items, key);
+    return 0;
 
   DLNode *node;
 
-  char *value;
-  while ((value = (char *)va_arg(items, char *)) != NULL)
+  while (arg && arg->type == DB_TYPE_STRING)
   {
-    node = create_DLNode(value, NULL, list->head);
+    node = create_dlnode(arg->value.string, NULL, list->head);
     if (list->head)
       list->head->prev = node;
     list->head = node;
     if (!list->tail)
       list->tail = node;
     list->length++;
+    arg = arg->next;
   }
 
-  return pthread_mutex_unlock(global_mutex), list->length;
+  return list->length;
 }
 
-DLNode *db_lpop(const char *key, db_size_t count)
+static DLList *db_lpop(const char *key, db_uint_t count)
 {
   if (!key || count == 0)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
+  DLList *list = get_dllist(key);
 
-  DLList *list = get_DLList(key);
+  if (!list || !list->head || count == 0)
+    return NULL;
 
-  if (!list || count == 0)
-    return pthread_mutex_unlock(global_mutex), NULL;
+  DLList *reply_list = create_dllist();
+  DLNode *first_removed_node = list->head;
+  DLNode *last_removed_node = first_removed_node;
+  db_uint_t counted = 0;
 
-  DLNode *head_node = list->head;
-  DLNode *tail_node = list->head;
+  while (++counted < count)
+    last_removed_node = last_removed_node->next;
 
-  if (!head_node)
-    return pthread_mutex_unlock(global_mutex), NULL;
-
-  db_size_t counted = 1;
-
-  while (counted < count)
-  {
-    if (!tail_node->next)
-      break;
-    tail_node = tail_node->next;
-    counted++;
-  }
-
-  list->head = tail_node->next;
+  list->head = last_removed_node->next;
+  last_removed_node->next = NULL;
   if (list->head)
     list->head->prev = NULL;
-  if (list->tail == tail_node)
+  else
     list->tail = NULL;
-  tail_node->next = NULL;
+  list->length -= count;
 
-  list->length -= counted;
+  reply_list->head = first_removed_node;
+  reply_list->tail = last_removed_node;
+  reply_list->length = count;
 
-  return pthread_mutex_unlock(global_mutex), head_node;
+  return reply_list;
 }
 
-db_size_t db_rpush(const char *key, ...)
+static db_uint_t db_rpush(const char *key, DBArg *arg)
 {
   if (!key)
     return 0;
 
-  pthread_mutex_lock(global_mutex);
-
-  DLList *list = get_or_create_DLList(key);
+  DLList *list = get_or_create_dllist(key);
 
   if (!list)
-    return pthread_mutex_unlock(global_mutex), 0;
-
-  va_list items;
-  va_start(items, key);
+    return 0;
 
   DLNode *node;
 
-  char *value;
-  while ((value = (char *)va_arg(items, char *)) != NULL)
+  while (arg && arg->type == DB_TYPE_STRING)
   {
-    node = create_DLNode(value, list->tail, NULL);
+    node = create_dlnode(arg->value.string, list->tail, NULL);
     if (list->tail)
       list->tail->next = node;
     list->tail = node;
     if (!list->head)
       list->head = node;
     list->length++;
+    arg = arg->next;
   }
 
-  return pthread_mutex_unlock(global_mutex), list->length;
+  return list->length;
 }
 
-DLNode *db_rpop(const char *key, db_size_t count)
+static DLList *db_rpop(const char *key, db_uint_t count)
 {
-  if (!key || count == 0)
+  if (!key)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
+  DLList *list = get_dllist(key);
 
-  DLList *list = get_DLList(key);
+  if (!list || !list->tail || count == 0)
+    return NULL;
 
-  if (!list || count == 0)
-    return pthread_mutex_unlock(global_mutex), NULL;
+  DLList *reply_list = create_dllist();
+  DLNode *first_removed_node = list->tail;
+  DLNode *last_removed_node = first_removed_node;
+  db_uint_t counted = 0;
 
-  DLNode *head_node = list->tail;
-  DLNode *tail_node = list->tail;
+  while (++counted < count)
+    first_removed_node = first_removed_node->prev;
 
-  if (!head_node)
-    return pthread_mutex_unlock(global_mutex), NULL;
-
-  db_size_t counted = 1;
-
-  while (counted < count)
-  {
-    if (!tail_node->prev)
-      break;
-    tail_node = tail_node->prev;
-    counted++;
-  }
-
-  list->tail = tail_node->prev;
+  list->tail = first_removed_node->prev;
+  first_removed_node->prev = NULL;
   if (list->tail)
     list->tail->next = NULL;
-  if (list->head == tail_node)
+  else
     list->head = NULL;
-  tail_node->prev = NULL;
+  list->length -= count;
 
-  list->length -= counted;
+  reply_list->head = first_removed_node;
+  reply_list->tail = last_removed_node;
+  reply_list->length = count;
 
-  return pthread_mutex_unlock(global_mutex), head_node;
+  return reply_list;
 }
 
-db_size_t db_llen(const char *key)
+static db_uint_t db_llen(const char *key)
 {
   if (!key)
     return 0;
 
-  pthread_mutex_lock(global_mutex);
-
-  DLList *list = get_DLList(key);
+  DLList *list = get_dllist(key);
 
   if (!list)
-    return pthread_mutex_unlock(global_mutex), 0;
+    return 0;
 
-  db_size_t length = list->length;
-
-  return pthread_mutex_unlock(global_mutex), length;
+  return list->length;
 }
 
-DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
+static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop)
 {
   if (!key)
     return NULL;
 
-  pthread_mutex_lock(global_mutex);
-
-  DLList *list = get_DLList(key);
+  DLList *list = get_dllist(key);
 
   if (!list || list->length == 0)
-    return pthread_mutex_unlock(global_mutex), NULL;
+    return NULL;
 
   if (stop == DB_SIZE_MAX || stop > list->length - 1)
     stop = list->length - 1;
@@ -964,15 +1021,10 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
   if (start > stop)
     start = 0;
 
-  printf("%lu %lu\n", start, stop);
-
-  if (start == 0 && stop == list->length - 1)
-    return pthread_mutex_unlock(global_mutex), duplicate_DLList(list);
-
-  DLList *new_list = create_DLList();
+  DLList *reply_list = create_dllist();
   DLNode *new_node = NULL;
   DLNode *curr_node;
-  db_size_t index;
+  db_uint_t index;
 
   if (start > list->length - 1 - stop)
   {
@@ -985,15 +1037,15 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
     }
     while (index >= start && curr_node)
     {
-      new_node = create_DLNode(curr_node->data, NULL, new_node);
-      if (!new_list->tail)
-        new_list->tail = new_node;
+      new_node = create_dlnode(curr_node->data, NULL, new_node);
+      if (!reply_list->tail)
+        reply_list->tail = new_node;
       if (new_node->next)
         new_node->next->prev = new_node;
       curr_node = curr_node->prev;
       index--;
     }
-    new_list->head = new_node;
+    reply_list->head = new_node;
   }
   else
   {
@@ -1006,18 +1058,409 @@ DLList *db_lrange(const char *key, db_size_t start, db_size_t stop)
     }
     while (index <= stop && curr_node)
     {
-      new_node = create_DLNode(curr_node->data, new_node, NULL);
-      if (!new_list->head)
-        new_list->head = new_node;
+      new_node = create_dlnode(curr_node->data, new_node, NULL);
+      if (!reply_list->head)
+        reply_list->head = new_node;
       if (new_node->prev)
         new_node->prev->next = new_node;
       curr_node = curr_node->next;
       index++;
     }
-    new_list->tail = new_node;
+    reply_list->tail = new_node;
   }
 
-  new_list->length = stop - start + 1;
+  reply_list->length = stop - start + 1;
 
-  return pthread_mutex_unlock(global_mutex), new_list;
+  return reply_list;
+}
+
+void db_config_hash_seed(db_uint_t _hash_seed)
+{
+  mtx_lock(lock);
+  hash_seed = _hash_seed ? _hash_seed : (db_uint_t)time(NULL);
+  mtx_unlock(lock);
+}
+
+void db_config_cron_hz(uint8_t _cron_hz)
+{
+  mtx_lock(lock);
+  cron_hz = _cron_hz;
+  cron_sleep_ns = (1.0 / cron_hz) * NANOSECONDS_PER_SECOND;
+  mtx_unlock(lock);
+}
+
+void db_config_persistence_filepath(const char *_persistence_filepath)
+{
+  mtx_lock(lock);
+  free(persistence_filepath);
+  persistence_filepath = helper_strdup(_persistence_filepath);
+  mtx_unlock(lock);
+}
+
+void db_start()
+{
+  if (!lock)
+  {
+    lock = (mtx_t *)calloc(1, sizeof(mtx_t));
+    if (!lock)
+      memory_error_handler(__FILE__, __LINE__, __func__);
+    mtx_init(lock, mtx_plain);
+  }
+
+  if (is_running)
+    return;
+
+  is_running = true;
+
+  free_table(tables[0]);
+  free_table(tables[1]);
+  tables[0] = create_table(INITIAL_TABLE_SIZE);
+  tables[1] = NULL;
+  rehashing_index = -1;
+
+  db_config_hash_seed(hash_seed);
+  db_config_cron_hz(cron_hz);
+  if (!persistence_filepath)
+    db_config_persistence_filepath(DEFAULT_PERSISTENCE_FILE);
+
+  // load data
+  FILE *file = fopen(persistence_filepath, "r");
+  if (file)
+  {
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = (char *)malloc(file_size + 1);
+    if (!buffer)
+      memory_error_handler(__FILE__, __LINE__, __func__);
+    fread(buffer, 1, file_size, file);
+    buffer[file_size] = '\0';
+    fclose(file);
+
+    char *key = NULL;
+    DLList *list;
+    cJSON *cjson_cursor = cJSON_Parse(buffer);
+    cJSON *cjson_array_cursor = NULL;
+    free(buffer);
+
+    if (cjson_cursor)
+      cjson_cursor = cjson_cursor->child;
+
+    while (cjson_cursor)
+    {
+      key = cjson_cursor->string;
+
+      if (!key)
+      {
+        cjson_cursor = cjson_cursor->next;
+        continue;
+      }
+
+      if (cJSON_IsString(cjson_cursor))
+      {
+        add_entry(create_entry(key, DB_TYPE_STRING, helper_strdup(cJSON_GetStringValue(cjson_cursor))));
+      }
+
+      else if (cJSON_IsArray(cjson_cursor))
+      {
+        cjson_array_cursor = cjson_cursor->child;
+
+        list = create_dllist();
+        while (cjson_array_cursor)
+        {
+          if (cJSON_IsString(cjson_array_cursor))
+          {
+            list->tail = create_dlnode(cJSON_GetStringValue(cjson_array_cursor), list->tail, NULL);
+            if (!list->head)
+              list->head = list->tail;
+          }
+
+          cjson_array_cursor = cjson_array_cursor->next;
+        }
+        add_entry(create_entry(key, DB_TYPE_LIST, list));
+      }
+
+      cjson_cursor = cjson_cursor->next;
+    }
+  }
+
+  thrd_create(&worker, main_thread, NULL);
+}
+
+void db_stop()
+{
+  if (!is_running)
+    return;
+
+  is_running = false;
+  thrd_join(worker, NULL);
+
+  mtx_lock(lock);
+  db_save(persistence_filepath);
+  mtx_unlock(lock);
+
+  rehashing_index = -1;
+  free_table(tables[0]);
+  free_table(tables[1]);
+}
+
+void db_save()
+{
+  if (!persistence_filepath)
+    return;
+
+  cJSON *root = cJSON_CreateObject();
+  HTEntry *entry;
+  DLNode *dllnode;
+  cJSON *cjson_list;
+
+  for (int j = 0; j < 2; j++)
+  {
+    if (!tables[j])
+      continue;
+
+    for (db_uint_t i = 0; i < tables[j]->size; i++)
+    {
+      entry = tables[j]->entries[i];
+      while (entry)
+      {
+        switch (entry->type)
+        {
+        case DB_TYPE_STRING:
+          cJSON_AddItemToObject(root, entry->key, cJSON_CreateString(entry->value.string));
+          break;
+        case DB_TYPE_LIST:
+          cjson_list = cJSON_CreateArray();
+          dllnode = entry->value.list->head;
+          while (dllnode)
+          {
+            cJSON_AddItemToArray(cjson_list, cJSON_CreateString(dllnode->data));
+            dllnode = dllnode->next;
+          }
+          cJSON_AddItemToObject(root, entry->key, cjson_list);
+          cjson_list = NULL;
+          dllnode = NULL;
+          break;
+        default:
+          break;
+        }
+        entry = entry->next;
+      }
+    }
+  }
+
+  FILE *file = fopen(persistence_filepath, "w");
+  if (!file)
+  {
+    perror("Failed to open file while saving.");
+    return;
+  }
+
+  char *json_string = cJSON_PrintUnformatted(root);
+  fputs(json_string, file);
+  fclose(file);
+  free(json_string);
+  cJSON_Delete(root);
+}
+
+void db_flushall()
+{
+  free_table(tables[0]);
+  free_table(tables[1]);
+  tables[0] = create_table(INITIAL_TABLE_SIZE);
+  tables[1] = NULL;
+  rehashing_index = -1;
+}
+
+DBRequest *db_create_request(db_action_t action)
+{
+  DBRequest *request = (DBRequest *)calloc(1, sizeof(DBRequest));
+  if (!request)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+  request->action = action;
+  return request;
+};
+
+DBRequest *db_reset_request(DBRequest *request, db_action_t action)
+{
+  if (!request)
+    return NULL;
+  request->action = action;
+  DBArg *arg = request->arg_head;
+  while (arg)
+  {
+    request->arg_head = arg->next;
+    free(arg);
+    arg = request->arg_head;
+  }
+  request->arg_head = NULL;
+  request->arg_tail = NULL;
+  return request;
+};
+
+static DBArg *add_arg(DBRequest *request, db_type_t type)
+{
+  if (!request)
+    return NULL;
+  DBArg *arg = (DBArg *)calloc(1, sizeof(DBArg));
+  if (!arg)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+  arg->type = type;
+  if (!request->arg_head)
+    request->arg_head = arg;
+  if (request->arg_tail)
+    request->arg_tail->next = arg;
+  request->arg_tail = arg;
+  return arg;
+};
+
+DBArg *db_add_arg_uint(DBRequest *request, db_uint_t value)
+{
+  if (!request)
+    return NULL;
+  DBArg *arg = add_arg(request, DB_TYPE_UINT);
+  arg->value.unsigned_int = value;
+  return arg;
+};
+
+DBArg *db_add_arg_int(DBRequest *request, db_int_t value)
+{
+  if (!request)
+    return NULL;
+  DBArg *arg = add_arg(request, DB_TYPE_INT);
+  arg->value.signed_int = value;
+  return arg;
+};
+
+DBArg *db_add_arg_string(DBRequest *request, const char *value)
+{
+  if (!request)
+    return NULL;
+  DBArg *arg = add_arg(request, DB_TYPE_STRING);
+  arg->value.string = helper_strdup(value);
+  return arg;
+};
+
+DBReply *db_send_request(DBRequest *request)
+{
+  if (!request)
+    return NULL;
+
+  DBReply *reply = (DBReply *)calloc(1, sizeof(DBReply));
+  if (!reply)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  reply->ok = false;
+
+  if (!is_running)
+  {
+    reply->ok = false;
+    reply->type = DB_TYPE_ERROR;
+    reply->value.string = helper_strdup(DB_ERR_DB_IS_CLOSED);
+    return reply;
+  }
+
+  RequestEntry *entry = (RequestEntry *)malloc(sizeof(RequestEntry));
+  if (!entry)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  entry->created_at = clock();
+  entry->request = request;
+  entry->reply = reply;
+  entry->next = NULL;
+  entry->done = false;
+
+  mtx_lock(lock);
+  if (!request_queue_head)
+  {
+    request_queue_head = entry;
+    request_queue_tail = entry;
+  }
+  else
+  {
+    request_queue_tail->next = entry;
+    request_queue_tail = entry;
+  }
+  mtx_unlock(lock);
+
+  while (!entry->done)
+    continue;
+
+  free(entry);
+
+  return reply;
+};
+
+void *db_free_request(DBRequest *request)
+{
+  if (!request)
+    return NULL;
+  DBArg *arg = request->arg_head;
+  DBArg *next_arg;
+  while (arg)
+  {
+    next_arg = arg->next;
+    free(arg);
+    arg = next_arg;
+  }
+  free(request);
+};
+
+void db_free_reply(DBReply *reply)
+{
+  if (!reply)
+    return;
+
+  switch (reply->type)
+  {
+  case DB_TYPE_ERROR:
+  case DB_TYPE_STRING:
+    free(reply->value.string);
+    break;
+  case DB_TYPE_LIST:
+    free_dllist(reply->value.list);
+    break;
+  case DB_TYPE_UINT:
+  default:
+    break;
+  }
+
+  free(reply);
+}
+
+DBReply *db_print_reply(DBReply *res)
+{
+  if (!res)
+  {
+    printf("(nil)\n");
+    return res;
+  }
+
+  switch (res->type)
+  {
+  case DB_TYPE_ERROR:
+    printf("(error) %s\n", res->value.string ? res->value.string : "");
+    break;
+  case DB_TYPE_STRING:
+    printf("%s\n", res->value.string ? res->value.string : "");
+    break;
+  case DB_TYPE_UINT:
+    printf("(uint) %u\n", res->value.unsigned_int);
+    break;
+  case DB_TYPE_LIST:
+    printf("(list) count: %u\n", res->value.list ? res->value.list->length : 0);
+    if (!res->value.list)
+      break;
+    db_uint_t i = 1;
+    DLNode *node = res->value.list->head;
+    while (node)
+      printf("  %u) %s\n", i++, node->data), node = node->next;
+    break;
+  default:
+    printf("(unknown)\n");
+    break;
+  }
+
+  return res;
 }
