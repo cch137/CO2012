@@ -21,7 +21,6 @@
 #define DEFAULT_PERSISTENCE_FILE "db.json"
 
 #define NANOSECONDS_PER_SECOND 1000000000L
-#define TIMEOUT_SEC 0.1F
 
 #define DB_ERR_DB_IS_CLOSED "Database is closed"
 #define DB_ERR_ARG_ERROR "Argument error"
@@ -155,7 +154,11 @@ static db_uint_t db_llen(const char *key);
 // The `stop` index is inclusive, and if `stop` is -1, the entire list is returned
 static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop);
 
-const static clock_t TIMEOUT_CLOCK = (clock_t)CLOCKS_PER_SEC * TIMEOUT_SEC;
+static bool arg_is_string(DBArg *arg);
+static bool arg_is_uint(DBArg *arg);
+static bool arg_is_int(DBArg *arg);
+static DBArg *arg_int_to_uint(DBArg *arg);
+static DBReply *set_reply_error(DBReply *arg, const char *message);
 
 // Seed for the hash function, affecting hash distribution
 static db_uint_t hash_seed = 0;
@@ -268,6 +271,10 @@ static int main_thread()
   DBRequest *request;
   DBReply *reply;
   DBArg *arg1, *arg2, *arg3;
+  // Calculate the sleep increment to reach 1 second over 5 minutes, in nanoseconds.
+  const long sleep_increment_ns = NANOSECONDS_PER_SECOND / (5 * 60 * 1000);
+  clock_t idle_start_time = 0;
+  long sleep_duration_ns = 0;
 
   thrd_create(&cron_worker, cron_thread, NULL);
 
@@ -275,200 +282,176 @@ static int main_thread()
   {
     if (mtx_trylock(lock) != thrd_success)
       continue;
-    maintenance();
-    while (request_queue_head)
+
+    if (request_queue_head)
     {
-      request = request_queue_head->request;
-      reply = request_queue_head->reply;
-      reply->ok = true;
-      switch (request->action)
+      if (request_queue_head->request->action != DB_INFO_DATASET_MEMORY)
       {
-      case DB_GET:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_STRING;
-        reply->value.string = db_get(arg1->value.string);
-        break;
-      case DB_SET:
-        arg1 = request->arg_head;
-        arg2 = arg1->next;
-        if (!arg1 || arg1->type != DB_TYPE_STRING || !arg2 || arg2->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_BOOL;
-        reply->value.boolean = db_set(arg1->value.string, arg2->value.string);
-        break;
-      case DB_RENAME:
-        arg1 = request->arg_head;
-        arg2 = arg1->next;
-        if (!arg1 || arg1->type != DB_TYPE_STRING || !arg2 || arg2->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_BOOL;
-        reply->value.boolean = db_rename(arg1->value.string, arg2->value.string);
-        break;
-      case DB_DEL:
-        reply->type = DB_TYPE_UINT;
-        reply->value.unsigned_int = db_del(request->arg_head);
-        break;
-      case DB_LPUSH:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        arg2 = arg1->next;
-        reply->type = DB_TYPE_UINT;
-        reply->value.unsigned_int = db_lpush(arg1->value.string, arg1->next);
-        break;
-      case DB_LPOP:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        arg2 = arg1->next;
-        if (!arg2)
-          arg2 = db_add_arg_uint(request, 1);
-        else if (arg2->type == DB_TYPE_INT)
-        {
-          arg2->type = DB_TYPE_UINT;
-          arg2->value.unsigned_int = arg2->value.signed_int;
-        }
-        if (arg2->type != DB_TYPE_UINT)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_LIST;
-        reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
-        break;
-      case DB_RPUSH:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        arg2 = arg1->next;
-        reply->type = DB_TYPE_UINT;
-        reply->value.unsigned_int = db_rpush(arg1->value.string, arg2);
-        break;
-      case DB_RPOP:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        arg2 = arg1->next;
-        if (!arg2)
-          arg2 = db_add_arg_uint(request, 1);
-        else if (arg2->type == DB_TYPE_INT)
-        {
-          arg2->type = DB_TYPE_UINT;
-          arg2->value.unsigned_int = arg2->value.signed_int;
-        }
-        if (arg2->type != DB_TYPE_UINT)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_LIST;
-        reply->value.list = db_rpop(arg1->value.string, arg2->value.unsigned_int);
-        break;
-      case DB_LLEN:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_UINT;
-        reply->value.unsigned_int = db_llen(arg1->value.string);
-        break;
-      case DB_LRANGE:
-        arg1 = request->arg_head;
-        if (!arg1 || arg1->type != DB_TYPE_STRING)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        arg2 = arg1->next;
-        arg3 = arg2 ? arg2->next : NULL;
-        if (arg2 && arg2->type == DB_TYPE_INT)
-        {
-          arg2->type = DB_TYPE_UINT;
-          arg2->value.unsigned_int = arg2->value.signed_int;
-        }
-        if (arg3 && arg3->type == DB_TYPE_INT)
-        {
-          arg3->type = DB_TYPE_UINT;
-          arg3->value.unsigned_int = arg3->value.signed_int;
-        }
-        if (!arg2 || arg2->type != DB_TYPE_UINT || !arg3 || arg3->type != DB_TYPE_UINT)
-        {
-          reply->ok = false;
-          reply->type = DB_TYPE_ERROR;
-          reply->value.string = helper_strdup(DB_ERR_ARG_ERROR);
-          break;
-        }
-        reply->type = DB_TYPE_LIST;
-        reply->value.list = db_lrange(arg1->value.string, arg2->value.unsigned_int, arg3->value.unsigned_int);
-        break;
-      case DB_FLUSHALL:
-        db_flushall();
-        reply->type = DB_TYPE_BOOL;
-        reply->value.boolean = true;
-        break;
-      case DB_INFO_DATASET_MEMORY:
-        reply->type = DB_TYPE_UINT;
-        reply->value.unsigned_int = get_dataset_memory_usage();
-        break;
-      default:
-        reply->ok = false;
-        reply->type = DB_TYPE_ERROR;
-        reply->value.string = helper_strdup(DB_ERR_UNKNOWN_COMMAND);
-        break;
+        idle_start_time = 0;
+        sleep_duration_ns = 0;
       }
-      request_queue_head->done = true;
-      request_queue_head = request_queue_head->next;
-      if (!request_queue_head)
-        request_queue_tail = NULL;
+      do
+      {
+        maintenance();
+        request = request_queue_head->request;
+        reply = request_queue_head->reply;
+        reply->ok = true;
+        switch (request->action)
+        {
+        case DB_GET:
+          arg1 = request->arg_head;
+          if (!arg_is_string(arg1))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_STRING;
+          reply->value.string = db_get(arg1->value.string);
+          break;
+        case DB_SET:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next : NULL;
+          if (!arg_is_string(arg1) || !arg_is_string(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_BOOL;
+          reply->value.boolean = db_set(arg1->value.string, arg2->value.string);
+          break;
+        case DB_RENAME:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next : NULL;
+          if (!arg_is_string(arg1) || !arg_is_string(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_BOOL;
+          reply->value.boolean = db_rename(arg1->value.string, arg2->value.string);
+          break;
+        case DB_DEL:
+          reply->type = DB_TYPE_UINT;
+          reply->value.unsigned_int = db_del(request->arg_head);
+          break;
+        case DB_LPUSH:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next : NULL;
+          if (!arg_is_string(arg1) || !arg_is_string(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_UINT;
+          reply->value.unsigned_int = db_lpush(arg1->value.string, arg2);
+          break;
+        case DB_LPOP:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next ? arg1->next : db_add_arg_uint(request, 1) : NULL;
+          if (arg_is_int(arg2))
+            arg_int_to_uint(arg2);
+          if (!arg_is_string(arg1) || !arg_is_uint(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_LIST;
+          reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
+          break;
+        case DB_RPUSH:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next : NULL;
+          if (!arg_is_string(arg1) || !arg_is_string(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_UINT;
+          reply->value.unsigned_int = db_rpush(arg1->value.string, arg2);
+          break;
+        case DB_RPOP:
+          arg1 = request->arg_head;
+          arg2 = arg1 ? arg1->next ? arg1->next : db_add_arg_uint(request, 1) : NULL;
+          if (arg_is_int(arg2))
+            arg_int_to_uint(arg2);
+          if (!arg_is_string(arg1) || !arg_is_uint(arg2))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_LIST;
+          reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
+          break;
+        case DB_LLEN:
+          arg1 = request->arg_head;
+          if (!arg_is_string(arg1))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_UINT;
+          reply->value.unsigned_int = db_llen(arg1->value.string);
+          break;
+        case DB_LRANGE:
+          arg1 = request->arg_head;
+          if (!arg_is_string(arg1))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          arg2 = arg1->next;
+          arg3 = arg2 ? arg2->next : NULL;
+          if (arg_is_int(arg2))
+            arg_int_to_uint(arg2);
+          if (arg2 && !arg3)
+            arg3 = db_add_arg_uint(request, -1);
+          else if (arg2 && arg_is_int(arg3))
+            arg_int_to_uint(arg3);
+          if (!arg_is_uint(arg2) || !arg_is_uint(arg3))
+          {
+            set_reply_error(reply, DB_ERR_ARG_ERROR);
+            break;
+          }
+          reply->type = DB_TYPE_LIST;
+          reply->value.list = db_lrange(arg1->value.string, arg2->value.unsigned_int, arg3->value.unsigned_int);
+          break;
+        case DB_FLUSHALL:
+          db_flushall();
+          reply->type = DB_TYPE_BOOL;
+          reply->value.boolean = true;
+          break;
+        case DB_INFO_DATASET_MEMORY:
+          reply->type = DB_TYPE_UINT;
+          reply->value.unsigned_int = get_dataset_memory_usage();
+          break;
+        default:
+          reply->ok = false;
+          reply->type = DB_TYPE_ERROR;
+          reply->value.string = helper_strdup(DB_ERR_UNKNOWN_COMMAND);
+          break;
+        }
+        request_queue_head->done = true;
+        request_queue_head = request_queue_head->next;
+        if (!request_queue_head)
+          request_queue_tail = NULL;
+      } while (request_queue_head);
+      mtx_unlock(lock);
     }
-    mtx_unlock(lock);
+    else
+    {
+      maintenance();
+      mtx_unlock(lock);
+      if (!idle_start_time)
+      {
+        idle_start_time = clock();
+      }
+      if ((clock() - idle_start_time) / CLOCKS_PER_SEC > 1)
+      {
+        if (sleep_duration_ns < NANOSECONDS_PER_SECOND)
+          sleep_duration_ns += sleep_increment_ns;
+        thrd_sleep(&(struct timespec){.tv_sec = 0, .tv_nsec = sleep_duration_ns}, NULL);
+      }
+    }
   }
 
   thrd_join(cron_worker, NULL);
@@ -1314,6 +1297,41 @@ static DBArg *add_arg(DBRequest *request, db_type_t type)
   request->arg_tail = arg;
   return arg;
 };
+
+static bool arg_is_string(DBArg *arg)
+{
+  return arg && arg->type == DB_TYPE_STRING;
+}
+
+static bool arg_is_uint(DBArg *arg)
+{
+  return arg && arg->type == DB_TYPE_UINT;
+}
+
+static bool arg_is_int(DBArg *arg)
+{
+  return arg && arg->type == DB_TYPE_INT;
+}
+
+static DBArg *arg_int_to_uint(DBArg *arg)
+{
+  if (arg_is_int(arg))
+  {
+    arg->type = DB_TYPE_UINT;
+    arg->value.unsigned_int = arg->value.signed_int;
+  }
+  return arg;
+}
+
+static DBReply *set_reply_error(DBReply *reply, const char *message)
+{
+  if (!reply)
+    return NULL;
+  reply->ok = false;
+  reply->type = DB_TYPE_ERROR;
+  reply->value.string = helper_strdup(message);
+  return reply;
+}
 
 DBArg *db_add_arg_uint(DBRequest *request, db_uint_t value)
 {

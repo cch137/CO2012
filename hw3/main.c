@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 #include <threads.h>
 
@@ -115,11 +116,15 @@ int main()
   db_add_arg_int(request, 4);
   db_free_reply(db_print_reply(db_send_request(request)));
 
-  db_uint_t sample_size = 10000;
+  clock_t t0;
+  db_uint_t sample_size = 100000;
+
+  char key[16];
+  char value[16];
+
+  t0 = clock();
   for (db_uint_t i = 0; i < sample_size; i++)
   {
-    char key[16];
-    char value[16];
     sprintf(key, "test:k%d", i);
     sprintf(value, "test:v%d", i);
     db_reset_request(request, DB_SET);
@@ -127,20 +132,35 @@ int main()
     db_add_arg_string(request, value);
     db_free_reply(db_send_request(request));
   }
+  printf("wrote %lu items in %lums\n", sample_size, (clock() - t0) / (CLOCKS_PER_SEC / 1000));
+
+  t0 = clock();
   for (db_uint_t i = 0; i < sample_size; i++)
   {
-    char key[16];
-    char value[16];
     sprintf(key, "test:k%d", i);
-    sprintf(value, "test:v%d", i);
+    db_reset_request(request, DB_GET);
+    db_add_arg_string(request, key);
+    db_free_reply(db_send_request(request));
+  }
+  printf("read %lu items in %lums\n", sample_size, (clock() - t0) / (CLOCKS_PER_SEC / 1000));
+
+  t0 = clock();
+  for (db_uint_t i = 0; i < sample_size; i++)
+  {
+    sprintf(key, "test:k%d", i);
     db_reset_request(request, DB_DEL);
     db_add_arg_string(request, key);
     db_free_reply(db_send_request(request));
   }
+  printf("deleted %lu items in %lums\n", sample_size, (clock() - t0) / (CLOCKS_PER_SEC / 1000));
 
   db_free_request(request);
 
   sleep(1);
+
+  running = false;
+
+  thrd_join(db_monitor_worker, NULL);
 
   db_stop();
 
