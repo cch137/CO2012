@@ -154,9 +154,9 @@ static db_uint_t db_llen(const char *key);
 // The `stop` index is inclusive, and if `stop` is -1, the entire list is returned
 static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop);
 
-static bool arg_is_string(DBArg *arg);
-static bool arg_is_uint(DBArg *arg);
-static bool arg_is_int(DBArg *arg);
+inline static bool arg_is_string(DBArg *arg);
+inline static bool arg_is_uint(DBArg *arg);
+inline static bool arg_is_int(DBArg *arg);
 static DBArg *arg_int_to_uint(DBArg *arg);
 static DBReply *set_reply_error(DBReply *arg, const char *message);
 
@@ -184,8 +184,8 @@ static bool is_running = false;
 static mtx_t *lock = NULL;
 static thrd_t worker = -1;
 
-static RequestEntry *request_queue_head;
-static RequestEntry *request_queue_tail;
+static RequestEntry *request_queue_head = NULL;
+static RequestEntry *request_queue_tail = NULL;
 
 static db_uint_t murmurhash2(const void *key, db_uint_t len)
 {
@@ -1298,17 +1298,17 @@ static DBArg *add_arg(DBRequest *request, db_type_t type)
   return arg;
 };
 
-static bool arg_is_string(DBArg *arg)
+inline static bool arg_is_string(DBArg *arg)
 {
   return arg && arg->type == DB_TYPE_STRING;
 }
 
-static bool arg_is_uint(DBArg *arg)
+inline static bool arg_is_uint(DBArg *arg)
 {
   return arg && arg->type == DB_TYPE_UINT;
 }
 
-static bool arg_is_int(DBArg *arg)
+inline static bool arg_is_int(DBArg *arg)
 {
   return arg && arg->type == DB_TYPE_INT;
 }
