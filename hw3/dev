@@ -22,7 +22,8 @@ function compile_and_run {
     # Compile the program
     eval $compile_command
     if [ $? -eq 0 ]; then
-        ./$OUTPUT_EXECUTABLE &
+        # Run the program in the background, redirecting stdin
+        ./$OUTPUT_EXECUTABLE < /dev/tty &
         current_pid=$!
     else
         echo -e "\n\e[41;37mCompilation failed. Skipping execution.\e[0m\n"

@@ -1,5 +1,6 @@
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <malloc.h>
 #include <unistd.h>
 #include <threads.h>
@@ -17,14 +18,36 @@
 // Load factor threshold for shrinking the hash table
 #define LOAD_FACTOR_SHRINK 0.1
 
-#define DEFAULT_CRON_HZ 10
 #define DEFAULT_PERSISTENCE_FILE "db.json"
 
 #define NANOSECONDS_PER_SECOND 1000000000L
 
-#define DB_ERR_DB_IS_CLOSED "Database is closed"
-#define DB_ERR_ARG_ERROR "Argument error"
-#define DB_ERR_UNKNOWN_COMMAND "Unknown command"
+#define DB_ERR_DB_IS_CLOSED "ERR database is closed"
+#define DB_ERR_ARG_ERROR "ERR wrong arguments "
+#define DB_ERR_WRONGTYPE "WRONGTYPE Operation against a key holding the wrong kind of value"
+#define DB_ERR_NONEXISTENT_KEY "ERR no such key"
+#define DB_ERR_UNKNOWN_COMMAND "ERR unknown command"
+
+typedef enum db_action_t
+{
+  DB_UNKNOWN_COMMAND,
+  DB_SAVE,
+  DB_START,
+  DB_SET,
+  DB_GET,
+  DB_RENAME,
+  DB_DEL,
+  DB_LPUSH,
+  DB_LPOP,
+  DB_RPUSH,
+  DB_RPOP,
+  DB_LLEN,
+  DB_LRANGE,
+  DB_KEYS,
+  DB_FLUSHALL,
+  DB_INFO_DATASET_MEMORY,
+  DB_SHUTDOWN
+} db_action_t;
 
 typedef struct HTEntry
 {
@@ -52,6 +75,25 @@ typedef struct HashTable
   HTEntry **entries;
 } HashTable;
 
+typedef struct DBArg
+{
+  db_type_t type;
+  union
+  {
+    char *string;
+    db_uint_t unsigned_int;
+    db_int_t signed_int;
+  } value;
+  struct DBArg *next;
+} DBArg;
+
+typedef struct DBRequest
+{
+  db_action_t action;
+  DBArg *arg_head;
+  DBArg *arg_tail;
+} DBRequest;
+
 typedef struct RequestEntry
 {
   clock_t created_at;
@@ -68,10 +110,6 @@ static db_uint_t murmurhash2(const void *key, db_uint_t len);
 static size_t get_dataset_memory_usage();
 
 static int main_thread();
-
-// Executes periodic tasks, including checking if rehashing should start
-// Resets recent_tasks_count after each execution
-static int cron_thread();
 
 // Executed during each low-level operation and periodic task to maintain the hash table size
 static void maintenance();
@@ -91,6 +129,8 @@ static HTEntry *create_entry(char *key, db_type_t type, void *value);
 
 // Frees the memory allocated for a hash table entry
 static void free_entry(HTEntry *entry);
+
+static void set_entry_value(HTEntry *entry, db_type_t type, void *value);
 
 // Retrieves an entry by key; returns NULL if not found
 static HTEntry *get_entry(const char *key);
@@ -120,51 +160,66 @@ static void free_dlnode_chain(DLNode *node);
 static void free_dllist(DLList *list);
 
 // Retrieves a string from the database by key; returns NULL if not found or type mismatch
-static char *db_get(const char *key);
+static void db_get(DBRequest *request, DBReply *reply);
 
 // Stores a string in the database with the specified key and value
 // Updates the value if the key exists, otherwise creates a new entry
 // Returns true if successful, false if type mismatch
-static bool db_set(const char *key, const char *value);
+static void db_set(DBRequest *request, DBReply *reply);
 
 // Renames an existing key to a new key in the database
 // Removes the old entry and inserts the new one with the updated key
 // Returns true if successful, false if type mismatch
-static bool db_rename(const char *old_key, const char *new_key);
+static void db_rename(DBRequest *request, DBReply *reply);
 
 // Deletes an entry by key; Returns the number of successfully deleted keys
-static db_uint_t db_del(DBArg *arg);
+static void db_del(DBRequest *request, DBReply *reply);
 
 // Pushes elements to the front of a list; last parameter must be NULL
-static db_uint_t db_lpush(const char *key, DBArg *arg);
+static void db_lpush(DBRequest *request, DBReply *reply);
 
 // Pops elements from the front of a list
-static DLList *db_lpop(const char *key, db_uint_t count);
+static void db_lpop(DBRequest *request, DBReply *reply);
 
 // Pushes elements to the end of a list; last parameter must be NULL
-static db_uint_t db_rpush(const char *key, DBArg *arg);
+static void db_rpush(DBRequest *request, DBReply *reply);
 
 // Pops elements from the end of a list
-static DLList *db_rpop(const char *key, db_uint_t count);
+static void db_rpop(DBRequest *request, DBReply *reply);
 
 // Returns the number of nodes in a list
-static db_uint_t db_llen(const char *key);
+static void db_llen(DBRequest *request, DBReply *reply);
 
 // Returns a sublist from the specified range of indices
 // The `stop` index is inclusive, and if `stop` is -1, the entire list is returned
-static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop);
+static void db_lrange(DBRequest *request, DBReply *reply);
 
-inline static bool arg_is_string(DBArg *arg);
-inline static bool arg_is_uint(DBArg *arg);
-inline static bool arg_is_int(DBArg *arg);
-static DBArg *arg_int_to_uint(DBArg *arg);
+static void db_keys(DBRequest *request, DBReply *reply);
+
+// Stops the database and saves data to a specified file
+static void db_shutdown();
+
+// Saves the current state of the database to persistent storage
+static void db_save();
+
+// Deletes all item from all databases.
+static void db_flushall();
+
+static DBRequest *create_request(db_action_t action);
+static DBRequest *reset_request(DBRequest *request, db_action_t action);
+static DBArg *add_arg_uint(DBRequest *request, db_uint_t uint_value);
+static DBArg *add_arg_string(DBRequest *request, const char *string_value);
+static DBReply *send_request(DBRequest *request);
+static void free_request(DBRequest *request);
+
+static DBArg *arg_string_to_uint(DBArg *arg);
 static DBReply *set_reply_error(DBReply *arg, const char *message);
+
+// Parses command string into DBRequest structure
+static DBRequest *parse_command(const char *command);
 
 // Seed for the hash function, affecting hash distribution
 static db_uint_t hash_seed = 0;
-// Frequency of periodic task execution per second
-static uint8_t cron_hz = DEFAULT_CRON_HZ;
-static long int cron_sleep_ns = -1;
 
 // File path for database persistence
 static char *persistence_filepath = NULL;
@@ -225,13 +280,13 @@ static size_t get_dataset_memory_usage()
   HTEntry *entry;
   DLNode *dllnode;
 
-  for (int j = 0; j < 2; j++)
+  for (int j = 0; j < 2; ++j)
   {
     if (!tables[j])
       continue;
     size += malloc_usable_size(tables[j]);
     size += malloc_usable_size(tables[j]->entries);
-    for (db_uint_t i = 0; i < tables[j]->size; i++)
+    for (db_uint_t i = 0; i < tables[j]->size; ++i)
     {
       entry = tables[j]->entries[i];
       while (entry)
@@ -267,7 +322,6 @@ static size_t get_dataset_memory_usage()
 static int main_thread()
 {
   clock_t t0;
-  thrd_t cron_worker;
   DBRequest *request;
   DBReply *reply;
   DBArg *arg1, *arg2, *arg3;
@@ -276,7 +330,8 @@ static int main_thread()
   clock_t idle_start_time = 0;
   long sleep_duration_ns = 0;
 
-  thrd_create(&cron_worker, cron_thread, NULL);
+  printf("Welcome to cch137's database!\n");
+  printf("Please use commands to interact with the database.\n");
 
   while (is_running)
   {
@@ -299,121 +354,37 @@ static int main_thread()
         switch (request->action)
         {
         case DB_GET:
-          arg1 = request->arg_head;
-          if (!arg_is_string(arg1))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_STRING;
-          reply->value.string = db_get(arg1->value.string);
+          db_get(request, reply);
           break;
         case DB_SET:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next : NULL;
-          if (!arg_is_string(arg1) || !arg_is_string(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_BOOL;
-          reply->value.boolean = db_set(arg1->value.string, arg2->value.string);
+          db_set(request, reply);
           break;
         case DB_RENAME:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next : NULL;
-          if (!arg_is_string(arg1) || !arg_is_string(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_BOOL;
-          reply->value.boolean = db_rename(arg1->value.string, arg2->value.string);
+          db_rename(request, reply);
           break;
         case DB_DEL:
-          reply->type = DB_TYPE_UINT;
-          reply->value.unsigned_int = db_del(request->arg_head);
+          db_del(request, reply);
           break;
         case DB_LPUSH:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next : NULL;
-          if (!arg_is_string(arg1) || !arg_is_string(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_UINT;
-          reply->value.unsigned_int = db_lpush(arg1->value.string, arg2);
+          db_lpush(request, reply);
           break;
         case DB_LPOP:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next ? arg1->next : db_add_arg_uint(request, 1) : NULL;
-          if (arg_is_int(arg2))
-            arg_int_to_uint(arg2);
-          if (!arg_is_string(arg1) || !arg_is_uint(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_LIST;
-          reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
+          db_lpop(request, reply);
           break;
         case DB_RPUSH:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next : NULL;
-          if (!arg_is_string(arg1) || !arg_is_string(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_UINT;
-          reply->value.unsigned_int = db_rpush(arg1->value.string, arg2);
+          db_rpush(request, reply);
           break;
         case DB_RPOP:
-          arg1 = request->arg_head;
-          arg2 = arg1 ? arg1->next ? arg1->next : db_add_arg_uint(request, 1) : NULL;
-          if (arg_is_int(arg2))
-            arg_int_to_uint(arg2);
-          if (!arg_is_string(arg1) || !arg_is_uint(arg2))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_LIST;
-          reply->value.list = db_lpop(arg1->value.string, arg2->value.unsigned_int);
+          db_rpop(request, reply);
           break;
         case DB_LLEN:
-          arg1 = request->arg_head;
-          if (!arg_is_string(arg1))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_UINT;
-          reply->value.unsigned_int = db_llen(arg1->value.string);
+          db_llen(request, reply);
           break;
         case DB_LRANGE:
-          arg1 = request->arg_head;
-          if (!arg_is_string(arg1))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          arg2 = arg1->next;
-          arg3 = arg2 ? arg2->next : NULL;
-          if (arg_is_int(arg2))
-            arg_int_to_uint(arg2);
-          if (arg2 && !arg3)
-            arg3 = db_add_arg_uint(request, -1);
-          else if (arg2 && arg_is_int(arg3))
-            arg_int_to_uint(arg3);
-          if (!arg_is_uint(arg2) || !arg_is_uint(arg3))
-          {
-            set_reply_error(reply, DB_ERR_ARG_ERROR);
-            break;
-          }
-          reply->type = DB_TYPE_LIST;
-          reply->value.list = db_lrange(arg1->value.string, arg2->value.unsigned_int, arg3->value.unsigned_int);
+          db_lrange(request, reply);
+          break;
+        case DB_KEYS:
+          db_keys(request, reply);
           break;
         case DB_FLUSHALL:
           db_flushall();
@@ -423,6 +394,16 @@ static int main_thread()
         case DB_INFO_DATASET_MEMORY:
           reply->type = DB_TYPE_UINT;
           reply->value.unsigned_int = get_dataset_memory_usage();
+          break;
+        case DB_SAVE:
+          db_save();
+          reply->type = DB_TYPE_BOOL;
+          reply->value.boolean = true;
+          break;
+        case DB_SHUTDOWN:
+          db_shutdown();
+          reply->type = DB_TYPE_BOOL;
+          reply->value.boolean = true;
           break;
         default:
           reply->ok = false;
@@ -445,7 +426,9 @@ static int main_thread()
       {
         idle_start_time = clock();
       }
-      if ((clock() - idle_start_time) / CLOCKS_PER_SEC > 1)
+      // If the idle time exceeds 100ms,
+      // a progressively increasing sleep period begins.
+      if ((clock() - idle_start_time) * 1000 / CLOCKS_PER_SEC > 100)
       {
         if (sleep_duration_ns < NANOSECONDS_PER_SECOND)
           sleep_duration_ns += sleep_increment_ns;
@@ -454,20 +437,6 @@ static int main_thread()
     }
   }
 
-  thrd_join(cron_worker, NULL);
-
-  return 0;
-}
-
-static int cron_thread()
-{
-  while (is_running)
-  {
-    mtx_lock(lock);
-    // TODO: scheduled task
-    mtx_unlock(lock);
-    thrd_sleep(&(struct timespec){.tv_sec = 0, .tv_nsec = cron_sleep_ns}, NULL);
-  }
   return 0;
 }
 
@@ -506,13 +475,13 @@ static bool rehash_step()
     index = murmurhash2(curr_entry->key, strlen(curr_entry->key)) % tables[1]->size;
     curr_entry->next = tables[1]->entries[index];
     tables[1]->entries[index] = curr_entry;
-    tables[1]->count++;
-    tables[0]->count--;
+    ++tables[1]->count;
+    --tables[0]->count;
     curr_entry = next_entry;
   }
 
   tables[0]->entries[rehashing_index] = NULL;
-  rehashing_index--;
+  --rehashing_index;
 
   if (rehashing_index == (int32_t)(-1))
   {
@@ -527,13 +496,13 @@ static bool rehash_step()
 
 static HashTable *create_table(db_uint_t size)
 {
-  HashTable *table = malloc(sizeof(HashTable));
+  HashTable *table = (HashTable *)malloc(sizeof(HashTable));
   if (!table)
     memory_error_handler(__FILE__, __LINE__, __func__);
 
   table->size = size;
   table->count = 0;
-  table->entries = calloc(size, sizeof(HTEntry *));
+  table->entries = (HTEntry **)calloc(size, sizeof(HTEntry *));
 
   if (!table->entries)
     memory_error_handler(__FILE__, __LINE__, __func__);
@@ -548,7 +517,7 @@ static void free_table(HashTable *table)
   db_uint_t i;
 
   HTEntry *curr_entry, *next_entry;
-  for (i = 0; i < table->size; i++)
+  for (i = 0; i < table->size; ++i)
   {
     curr_entry = table->entries[i];
     next_entry = NULL;
@@ -575,21 +544,9 @@ static HTEntry *create_entry(char *key, db_type_t type, void *value)
     memory_error_handler(__FILE__, __LINE__, __func__);
 
   entry->key = key;
+  entry->next = NULL;
 
-  switch (type)
-  {
-  case DB_TYPE_STRING:
-    entry->value.string = value;
-    break;
-  case DB_TYPE_LIST:
-    entry->value.list = value;
-    break;
-  default:
-    free(entry);
-    return NULL;
-  }
-
-  entry->type = type;
+  set_entry_value(entry, type, value);
 
   return entry;
 }
@@ -602,12 +559,48 @@ static void free_entry(HTEntry *entry)
   if (entry->key)
     free(entry->key);
 
-  if (entry->type == DB_TYPE_STRING)
-    free(entry->value.string);
-  else if (entry->type == DB_TYPE_LIST)
-    free_dllist(entry->value.list);
+  set_entry_value(entry, DB_TYPE_NULL, NULL);
 
   free(entry);
+}
+
+static void set_entry_value(HTEntry *entry, db_type_t type, void *value)
+{
+  if (!entry)
+    return;
+
+  if (entry->type != type)
+  {
+    switch (entry->type)
+    {
+    case DB_TYPE_STRING:
+      free(entry->value.string);
+      entry->value.string = NULL;
+      break;
+    case DB_TYPE_LIST:
+      free_dllist(entry->value.list);
+      entry->value.list = NULL;
+      break;
+    default:
+      break;
+    }
+    entry->type = type;
+  }
+
+  if (!value)
+    return;
+
+  switch (type)
+  {
+  case DB_TYPE_STRING:
+    entry->value.string = value;
+    break;
+  case DB_TYPE_LIST:
+    entry->value.list = value;
+    break;
+  default:
+    break;
+  }
 }
 
 static HTEntry *get_entry(const char *key)
@@ -651,14 +644,14 @@ static HTEntry *add_entry(HTEntry *entry)
     index = murmurhash2(entry->key, strlen(entry->key)) % tables[1]->size;
     entry->next = tables[1]->entries[index];
     tables[1]->entries[index] = entry;
-    tables[1]->count++;
+    ++tables[1]->count;
     return entry;
   }
 
   index = murmurhash2(entry->key, strlen(entry->key)) % tables[0]->size;
   entry->next = tables[0]->entries[index];
   tables[0]->entries[index] = entry;
-  tables[0]->count++;
+  ++tables[0]->count;
   return entry;
 }
 
@@ -682,7 +675,7 @@ static HTEntry *remove_entry(const char *key)
           prev_entry->next = curr_entry->next;
         else
           tables[1]->entries[index] = curr_entry->next;
-        tables[1]->count--;
+        --tables[1]->count;
         return curr_entry;
       }
       prev_entry = curr_entry;
@@ -701,7 +694,7 @@ static HTEntry *remove_entry(const char *key)
         prev_entry->next = curr_entry->next;
       else
         tables[0]->entries[index] = curr_entry->next;
-      tables[0]->count--;
+      --tables[0]->count;
       return curr_entry;
     }
     prev_entry = curr_entry;
@@ -718,7 +711,11 @@ static DLNode *create_dlnode(const char *data, DLNode *prev, DLNode *next)
     memory_error_handler(__FILE__, __LINE__, __func__);
   node->data = helper_strdup(data);
   node->prev = prev;
+  if (prev)
+    prev->next = node;
   node->next = next;
+  if (next)
+    next->prev = node;
   return node;
 }
 
@@ -803,208 +800,318 @@ static void free_dllist(DLList *list)
   free(list);
 }
 
-static char *db_get(const char *key)
+static void db_get(DBRequest *request, DBReply *reply)
 {
-  HTEntry *entry = get_entry(key);
+  DBArg *arg1 = request->arg_head;
+
+  if (!arg1)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
+
+  reply->type = DB_TYPE_STRING;
+  HTEntry *entry = get_entry(arg1->value.string);
+
   if (entry && entry->type == DB_TYPE_STRING)
-    return helper_strdup(entry->value.string); // Return the string value
-  return NULL;                                 // Not found
+  {
+    // Return the string value
+    reply->type = DB_TYPE_STRING;
+    reply->value.string = helper_strdup(entry->value.string);
+  }
+  else
+  {
+    // Not found
+    reply->type = DB_TYPE_NULL;
+  }
 }
 
-static bool db_set(const char *key, const char *value)
+static void db_set(DBRequest *request, DBReply *reply)
 {
-  HTEntry *entry = get_entry(key);
-  if (!entry)
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next : NULL;
+
+  if (!arg1 || !arg2)
   {
-    add_entry(create_entry(helper_strdup(key), DB_TYPE_STRING, helper_strdup(value)));
-    return true;
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
   }
-  if (entry->type == DB_TYPE_STRING)
-  {
-    free(entry->value.string);                  // Free old value
-    entry->value.string = helper_strdup(value); // Update with new value
-    return true;
-  }
-  return false;
+
+  HTEntry *entry = get_entry(arg1->value.string);
+
+  if (entry)
+    set_entry_value(entry, DB_TYPE_STRING, helper_strdup(arg2->value.string));
+  else
+    add_entry(create_entry(helper_strdup(arg1->value.string), DB_TYPE_STRING, helper_strdup(arg2->value.string)));
+
+  reply->type = DB_TYPE_BOOL;
+  reply->value.boolean = true;
 }
 
-static bool db_rename(const char *old_key, const char *new_key)
+static void db_rename(DBRequest *request, DBReply *reply)
 {
-  HTEntry *entry = remove_entry(old_key);
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next : NULL;
+
+  if (!arg1 || !arg2)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
+
+  HTEntry *entry = remove_entry(arg1->value.string);
+
   if (!entry)
-    return false;
+  {
+    set_reply_error(reply, DB_ERR_NONEXISTENT_KEY);
+    return;
+  }
+
   free(entry->key);
-  entry->key = helper_strdup(new_key);
+  entry->key = helper_strdup(arg2->value.string);
   add_entry(entry);
-  return true;
+
+  reply->type = DB_TYPE_BOOL;
+  reply->value.boolean = true;
 }
 
-static db_uint_t db_del(DBArg *arg)
+static void db_del(DBRequest *request, DBReply *reply)
 {
+  DBArg *arg = request->arg_head;
+
+  if (!arg)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
+
   HTEntry *entry;
   db_uint_t deleted_count = 0;
 
-  while (arg && arg->type == DB_TYPE_STRING)
+  while (arg)
   {
     entry = remove_entry(arg->value.string);
     if (entry)
-      free_entry(entry), deleted_count++;
+      free_entry(entry), ++deleted_count;
     arg = arg->next;
   }
 
-  return deleted_count;
+  reply->type = DB_TYPE_UINT;
+  reply->value.unsigned_int = deleted_count;
 }
 
-static db_uint_t db_lpush(const char *key, DBArg *arg)
+static void db_lpush(DBRequest *request, DBReply *reply)
 {
-  if (!key)
-    return 0;
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next : NULL;
 
-  DLList *list = get_or_create_dllist(key);
+  if (!arg1 || !arg2)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
+
+  DLList *list = get_or_create_dllist(arg1->value.string);
 
   if (!list)
-    return 0;
-
-  DLNode *node;
-
-  while (arg && arg->type == DB_TYPE_STRING)
   {
-    node = create_dlnode(arg->value.string, NULL, list->head);
-    if (list->head)
-      list->head->prev = node;
-    list->head = node;
-    if (!list->tail)
-      list->tail = node;
-    list->length++;
-    arg = arg->next;
+    set_reply_error(reply, DB_ERR_WRONGTYPE);
+    return;
   }
 
-  return list->length;
+  while (arg2)
+  {
+    list->head = create_dlnode(arg2->value.string, NULL, list->head);
+    if (!list->tail)
+      list->tail = list->head;
+    ++list->length;
+    arg2 = arg2->next;
+  }
+
+  reply->type = DB_TYPE_UINT;
+  reply->value.unsigned_int = list->length;
 }
 
-static DLList *db_lpop(const char *key, db_uint_t count)
+static void db_lpop(DBRequest *request, DBReply *reply)
 {
-  if (!key || count == 0)
-    return NULL;
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next ? arg_string_to_uint(arg1->next) : add_arg_uint(request, 1) : NULL;
 
-  DLList *list = get_dllist(key);
+  if (!arg1 || !arg2)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
 
-  if (!list || !list->head || count == 0)
-    return NULL;
+  DLList *list = get_dllist(arg1->value.string);
+
+  if (!list)
+  {
+    reply->type = DB_TYPE_NULL;
+    return;
+  }
 
   DLList *reply_list = create_dllist();
   DLNode *first_removed_node = list->head;
   DLNode *last_removed_node = first_removed_node;
+  db_uint_t count = arg2->value.unsigned_int;
+
+  reply->type = DB_TYPE_LIST;
+  reply->value.list = reply_list;
+
+  if (!count || !last_removed_node)
+    return;
+
   db_uint_t counted = 0;
 
-  while (++counted < count)
+  while (++counted < count && last_removed_node)
     last_removed_node = last_removed_node->next;
 
-  list->head = last_removed_node->next;
-  last_removed_node->next = NULL;
+  if (last_removed_node)
+  {
+    list->head = last_removed_node->next;
+    last_removed_node->next = NULL;
+  }
+
   if (list->head)
     list->head->prev = NULL;
   else
     list->tail = NULL;
-  list->length -= count;
+
+  list->length -= counted;
 
   reply_list->head = first_removed_node;
   reply_list->tail = last_removed_node;
-  reply_list->length = count;
-
-  return reply_list;
+  reply_list->length = counted;
 }
 
-static db_uint_t db_rpush(const char *key, DBArg *arg)
+static void db_rpush(DBRequest *request, DBReply *reply)
 {
-  if (!key)
-    return 0;
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next : NULL;
 
-  DLList *list = get_or_create_dllist(key);
-
-  if (!list)
-    return 0;
-
-  DLNode *node;
-
-  while (arg && arg->type == DB_TYPE_STRING)
+  if (!arg1 || !arg2)
   {
-    node = create_dlnode(arg->value.string, list->tail, NULL);
-    if (list->tail)
-      list->tail->next = node;
-    list->tail = node;
-    if (!list->head)
-      list->head = node;
-    list->length++;
-    arg = arg->next;
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
   }
 
-  return list->length;
+  DLList *list = get_or_create_dllist(arg1->value.string);
+
+  if (!list)
+  {
+    set_reply_error(reply, DB_ERR_WRONGTYPE);
+    return;
+  }
+
+  while (arg2)
+  {
+    list->tail = create_dlnode(arg2->value.string, list->tail, NULL);
+    if (!list->head)
+      list->head = list->tail;
+    ++list->length;
+    arg2 = arg2->next;
+  }
+
+  reply->type = DB_TYPE_UINT;
+  reply->value.unsigned_int = list->length;
 }
 
-static DLList *db_rpop(const char *key, db_uint_t count)
+static void db_rpop(DBRequest *request, DBReply *reply)
 {
-  if (!key)
-    return NULL;
+  DBArg *arg1 = request->arg_head;
+  DBArg *arg2 = arg1 ? arg1->next ? arg_string_to_uint(arg1->next) : add_arg_uint(request, 1) : NULL;
 
-  DLList *list = get_dllist(key);
+  if (!arg1 || !arg2)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
 
-  if (!list || !list->tail || count == 0)
-    return NULL;
+  DLList *list = get_dllist(arg1->value.string);
+
+  if (!list)
+  {
+    reply->type = DB_TYPE_NULL;
+    return;
+  }
 
   DLList *reply_list = create_dllist();
   DLNode *first_removed_node = list->tail;
   DLNode *last_removed_node = first_removed_node;
+  db_uint_t count = arg2->value.unsigned_int;
+
+  reply->type = DB_TYPE_LIST;
+  reply->value.list = reply_list;
+
+  if (!count || !last_removed_node)
+    return;
+
   db_uint_t counted = 0;
 
-  while (++counted < count)
+  while (++counted < count && first_removed_node)
     first_removed_node = first_removed_node->prev;
 
-  list->tail = first_removed_node->prev;
-  first_removed_node->prev = NULL;
+  if (first_removed_node)
+  {
+    list->tail = first_removed_node->prev;
+    first_removed_node->prev = NULL;
+  }
+
   if (list->tail)
     list->tail->next = NULL;
   else
     list->head = NULL;
-  list->length -= count;
+
+  list->length -= counted;
 
   reply_list->head = first_removed_node;
   reply_list->tail = last_removed_node;
-  reply_list->length = count;
-
-  return reply_list;
+  reply_list->length = counted;
 }
 
-static db_uint_t db_llen(const char *key)
+static void db_llen(DBRequest *request, DBReply *reply)
 {
-  if (!key)
-    return 0;
+  DBArg *arg1 = request->arg_head;
 
-  DLList *list = get_dllist(key);
+  if (!arg1)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
 
-  if (!list)
-    return 0;
+  DLList *list = get_dllist(arg1->value.string);
 
-  return list->length;
+  reply->type = DB_TYPE_UINT;
+  reply->value.unsigned_int = list ? list->length : 0;
 }
 
-static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop)
+static void db_lrange(DBRequest *request, DBReply *reply)
 {
-  if (!key)
-    return NULL;
+  DBArg *arg1 = request->arg_head;
 
-  DLList *list = get_dllist(key);
+  if (!arg1)
+  {
+    set_reply_error(reply, DB_ERR_ARG_ERROR);
+    return;
+  }
 
-  if (!list || list->length == 0)
-    return NULL;
+  db_uint_t start = arg1->next ? arg_string_to_uint(arg1->next)->value.unsigned_int : 0;
+  db_uint_t stop = arg1->next ? arg1->next->next ? arg_string_to_uint(arg1->next->next)->value.unsigned_int : DB_UINT_MAX : DB_UINT_MAX;
+  DLList *list = get_dllist(arg1->value.string);
+  DLList *reply_list = create_dllist();
 
-  if (stop == DB_SIZE_MAX || stop > list->length - 1)
+  reply->type = DB_TYPE_LIST;
+  reply->value.list = reply_list;
+
+  if (!list || list->length == 0 || start > stop)
+    return;
+
+  if (stop == DB_UINT_MAX || stop > list->length - 1)
     stop = list->length - 1;
 
-  if (start > stop)
-    start = 0;
-
-  DLList *reply_list = create_dllist();
+  // The new node must be initialized to NULL,
+  // as it will be assigned to the reply list regardless of whether it has been created.
   DLNode *new_node = NULL;
   DLNode *curr_node;
   db_uint_t index;
@@ -1016,17 +1123,15 @@ static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop)
     while (index != stop && curr_node)
     {
       curr_node = curr_node->prev;
-      index--;
+      --index;
     }
     while (index >= start && curr_node)
     {
       new_node = create_dlnode(curr_node->data, NULL, new_node);
       if (!reply_list->tail)
         reply_list->tail = new_node;
-      if (new_node->next)
-        new_node->next->prev = new_node;
       curr_node = curr_node->prev;
-      index--;
+      --index;
     }
     reply_list->head = new_node;
   }
@@ -1037,38 +1142,54 @@ static DLList *db_lrange(const char *key, db_uint_t start, db_uint_t stop)
     while (index != start && curr_node)
     {
       curr_node = curr_node->next;
-      index++;
+      ++index;
     }
     while (index <= stop && curr_node)
     {
       new_node = create_dlnode(curr_node->data, new_node, NULL);
       if (!reply_list->head)
         reply_list->head = new_node;
-      if (new_node->prev)
-        new_node->prev->next = new_node;
       curr_node = curr_node->next;
-      index++;
+      ++index;
     }
     reply_list->tail = new_node;
   }
 
   reply_list->length = stop - start + 1;
+}
 
-  return reply_list;
+static void db_keys(DBRequest *request, DBReply *reply)
+{
+  HTEntry *entry;
+  db_uint_t r;
+  DLList *reply_list = create_dllist();
+
+  reply->type = DB_TYPE_LIST;
+  reply->value.list = reply_list;
+
+  for (db_uint_t t = 0; t < 2; ++t)
+  {
+    if (!tables[t])
+      continue;
+    for (r = 0; r < tables[t]->size; ++r)
+    {
+      entry = tables[t]->entries[r];
+      while (entry)
+      {
+        reply_list->tail = create_dlnode(entry->key, reply_list->tail, NULL);
+        if (!reply_list->head)
+          reply_list->head = reply_list->tail;
+        ++reply_list->length;
+        entry = entry->next;
+      }
+    }
+  }
 }
 
 void db_config_hash_seed(db_uint_t _hash_seed)
 {
   mtx_lock(lock);
   hash_seed = _hash_seed ? _hash_seed : (db_uint_t)time(NULL);
-  mtx_unlock(lock);
-}
-
-void db_config_cron_hz(uint8_t _cron_hz)
-{
-  mtx_lock(lock);
-  cron_hz = _cron_hz;
-  cron_sleep_ns = (1.0 / cron_hz) * NANOSECONDS_PER_SECOND;
   mtx_unlock(lock);
 }
 
@@ -1095,14 +1216,9 @@ void db_start()
 
   is_running = true;
 
-  free_table(tables[0]);
-  free_table(tables[1]);
-  tables[0] = create_table(INITIAL_TABLE_SIZE);
-  tables[1] = NULL;
-  rehashing_index = -1;
+  db_flushall();
 
   db_config_hash_seed(hash_seed);
-  db_config_cron_hz(cron_hz);
   if (!persistence_filepath)
     db_config_persistence_filepath(DEFAULT_PERSISTENCE_FILE);
 
@@ -1140,6 +1256,8 @@ void db_start()
         continue;
       }
 
+      maintenance();
+
       if (cJSON_IsString(cjson_cursor))
       {
         add_entry(create_entry(key, DB_TYPE_STRING, helper_strdup(cJSON_GetStringValue(cjson_cursor))));
@@ -1157,6 +1275,7 @@ void db_start()
             list->tail = create_dlnode(cJSON_GetStringValue(cjson_array_cursor), list->tail, NULL);
             if (!list->head)
               list->head = list->tail;
+            ++list->length;
           }
 
           cjson_array_cursor = cjson_array_cursor->next;
@@ -1171,7 +1290,7 @@ void db_start()
   thrd_create(&worker, main_thread, NULL);
 }
 
-void db_stop()
+static void db_shutdown()
 {
   if (!is_running)
     return;
@@ -1179,16 +1298,14 @@ void db_stop()
   is_running = false;
   thrd_join(worker, NULL);
 
-  mtx_lock(lock);
-  db_save(persistence_filepath);
-  mtx_unlock(lock);
+  db_save();
 
   rehashing_index = -1;
   free_table(tables[0]);
   free_table(tables[1]);
 }
 
-void db_save()
+static void db_save()
 {
   if (!persistence_filepath)
     return;
@@ -1198,12 +1315,12 @@ void db_save()
   DLNode *dllnode;
   cJSON *cjson_list;
 
-  for (int j = 0; j < 2; j++)
+  for (int j = 0; j < 2; ++j)
   {
     if (!tables[j])
       continue;
 
-    for (db_uint_t i = 0; i < tables[j]->size; i++)
+    for (db_uint_t i = 0; i < tables[j]->size; ++i)
     {
       entry = tables[j]->entries[i];
       while (entry)
@@ -1247,16 +1364,18 @@ void db_save()
   cJSON_Delete(root);
 }
 
-void db_flushall()
+static void db_flushall()
 {
   free_table(tables[0]);
   free_table(tables[1]);
+
   tables[0] = create_table(INITIAL_TABLE_SIZE);
   tables[1] = NULL;
+
   rehashing_index = -1;
 }
 
-DBRequest *db_create_request(db_action_t action)
+static DBRequest *create_request(db_action_t action)
 {
   DBRequest *request = (DBRequest *)calloc(1, sizeof(DBRequest));
   if (!request)
@@ -1265,7 +1384,7 @@ DBRequest *db_create_request(db_action_t action)
   return request;
 };
 
-DBRequest *db_reset_request(DBRequest *request, db_action_t action)
+static DBRequest *reset_request(DBRequest *request, db_action_t action)
 {
   if (!request)
     return NULL;
@@ -1298,27 +1417,15 @@ static DBArg *add_arg(DBRequest *request, db_type_t type)
   return arg;
 };
 
-inline static bool arg_is_string(DBArg *arg)
+static DBArg *arg_string_to_uint(DBArg *arg)
 {
-  return arg && arg->type == DB_TYPE_STRING;
-}
-
-inline static bool arg_is_uint(DBArg *arg)
-{
-  return arg && arg->type == DB_TYPE_UINT;
-}
-
-inline static bool arg_is_int(DBArg *arg)
-{
-  return arg && arg->type == DB_TYPE_INT;
-}
-
-static DBArg *arg_int_to_uint(DBArg *arg)
-{
-  if (arg_is_int(arg))
+  if (arg && arg->type == DB_TYPE_STRING)
   {
     arg->type = DB_TYPE_UINT;
-    arg->value.unsigned_int = arg->value.signed_int;
+    char *s = arg->value.string;
+    if (s)
+      arg->value.unsigned_int = strtoul(s, NULL, 10),
+      free(s);
   }
   return arg;
 }
@@ -1333,7 +1440,7 @@ static DBReply *set_reply_error(DBReply *reply, const char *message)
   return reply;
 }
 
-DBArg *db_add_arg_uint(DBRequest *request, db_uint_t value)
+static DBArg *add_arg_uint(DBRequest *request, db_uint_t value)
 {
   if (!request)
     return NULL;
@@ -1342,16 +1449,7 @@ DBArg *db_add_arg_uint(DBRequest *request, db_uint_t value)
   return arg;
 };
 
-DBArg *db_add_arg_int(DBRequest *request, db_int_t value)
-{
-  if (!request)
-    return NULL;
-  DBArg *arg = add_arg(request, DB_TYPE_INT);
-  arg->value.signed_int = value;
-  return arg;
-};
-
-DBArg *db_add_arg_string(DBRequest *request, const char *value)
+static DBArg *add_arg_string(DBRequest *request, const char *value)
 {
   if (!request)
     return NULL;
@@ -1360,7 +1458,7 @@ DBArg *db_add_arg_string(DBRequest *request, const char *value)
   return arg;
 };
 
-DBReply *db_send_request(DBRequest *request)
+static DBReply *send_request(DBRequest *request)
 {
   if (!request)
     return NULL;
@@ -1402,28 +1500,196 @@ DBReply *db_send_request(DBRequest *request)
   }
   mtx_unlock(lock);
 
-  while (!entry->done)
-    continue;
+  while (true)
+  {
+    mtx_lock(lock);
+    if (entry->done)
+    {
+      mtx_unlock(lock);
+      break;
+    }
+    mtx_unlock(lock);
+  }
 
   free(entry);
 
   return reply;
 };
 
-void *db_free_request(DBRequest *request)
+static void free_request(DBRequest *request)
 {
   if (!request)
-    return NULL;
+    return;
   DBArg *arg = request->arg_head;
-  DBArg *next_arg;
   while (arg)
   {
-    next_arg = arg->next;
+    request->arg_head = arg->next;
+    if (arg->type == DB_TYPE_STRING)
+      free(arg->value.string);
     free(arg);
-    arg = next_arg;
+    arg = request->arg_head;
   }
   free(request);
 };
+
+static DBRequest *parse_command(const char *command)
+{
+  DBRequest *request = (DBRequest *)calloc(1, sizeof(DBRequest));
+  if (!request)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  // Duplicate command for tokenization
+  char *command_copy = helper_strdup(command);
+  if (!command_copy)
+    memory_error_handler(__FILE__, __LINE__, __func__);
+
+  char *token = strtok(command_copy, " ");
+
+  // Parse action string into db_action_t
+  to_uppercase(token);
+  if (!token)
+    request->action = DB_UNKNOWN_COMMAND;
+  if (strcmp(token, "SAVE") == 0)
+    request->action = DB_SAVE;
+  else if (strcmp(token, "START") == 0)
+    request->action = DB_START;
+  else if (strcmp(token, "SET") == 0)
+    request->action = DB_SET;
+  else if (strcmp(token, "GET") == 0)
+    request->action = DB_GET;
+  else if (strcmp(token, "RENAME") == 0)
+    request->action = DB_RENAME;
+  else if (strcmp(token, "DEL") == 0)
+    request->action = DB_DEL;
+  else if (strcmp(token, "LPUSH") == 0)
+    request->action = DB_LPUSH;
+  else if (strcmp(token, "LPOP") == 0)
+    request->action = DB_LPOP;
+  else if (strcmp(token, "RPUSH") == 0)
+    request->action = DB_RPUSH;
+  else if (strcmp(token, "RPOP") == 0)
+    request->action = DB_RPOP;
+  else if (strcmp(token, "LLEN") == 0)
+    request->action = DB_LLEN;
+  else if (strcmp(token, "LRANGE") == 0)
+    request->action = DB_LRANGE;
+  else if (strcmp(token, "KEYS") == 0)
+    request->action = DB_KEYS;
+  else if (strcmp(token, "FLUSHALL") == 0)
+    request->action = DB_FLUSHALL;
+  else if (strcmp(token, "INFO_DATASET_MEMORY") == 0)
+    request->action = DB_INFO_DATASET_MEMORY;
+  else if (strcmp(token, "SHUTDOWN") == 0)
+    request->action = DB_SHUTDOWN;
+  else
+    request->action = DB_UNKNOWN_COMMAND;
+
+  // Move past action in original command string
+  const char *pos = command + strlen(token);
+
+  while (*pos != '\0')
+  {
+    // Skip extra whitespace
+    while (isspace(*pos))
+      ++pos;
+
+    if (*pos == '\0')
+      break;
+
+    DBArg *arg = NULL;
+    if (*pos == '"')
+    {
+      // Parse quoted string
+      ++pos;
+      const char *start = pos;
+      size_t length = 0;
+      char *string_value = NULL;
+
+      // Continue until end of string or until reaching an unescaped quote
+      while (*pos != '\0' && (*pos != '"' || (*(pos - 1) == '\\' && pos != start)))
+      {
+        // Handle escape
+        if (*pos == '\\' && *(pos + 1) == '"')
+          ++pos;
+        ++pos;
+        ++length;
+      }
+
+      if (*pos == '"')
+      {
+        string_value = (char *)malloc(length + 1);
+        if (!string_value)
+          memory_error_handler(__FILE__, __LINE__, __func__);
+
+        // Remove escape sequences
+        size_t i = 0;
+        const char *src = start;
+        while (src < pos)
+        {
+          if (*src == '\\' && *(src + 1) == '"')
+          {
+            string_value[i++] = '"';
+            src += 2;
+          }
+          else
+          {
+            string_value[i++] = *src++;
+          }
+        }
+        string_value[i] = '\0';
+        ++pos;
+
+        arg = add_arg_string(request, string_value);
+        free(string_value);
+      }
+    }
+    else
+    {
+      // Parse signed or unsigned integer, or treat as a string
+      char *endptr = NULL;
+      const char *start = pos;
+      while (*pos != '\0' && !isspace(*pos))
+        ++pos;
+      size_t length = pos - start;
+
+      char *string_value = (char *)malloc(length + 1);
+      if (!string_value)
+        memory_error_handler(__FILE__, __LINE__, __func__);
+
+      strncpy(string_value, start, length);
+      string_value[length] = '\0';
+
+      arg = add_arg_string(request, string_value);
+      free(string_value);
+    }
+
+    if (!arg)
+      memory_error_handler(__FILE__, __LINE__, __func__);
+  }
+
+  free(command_copy);
+  return request;
+}
+
+DBReply *db_command(const char *command)
+{
+  if (!command)
+    return NULL;
+  DBRequest *request = parse_command(command);
+  if (!request)
+    return NULL;
+  DBReply *reply = send_request(request);
+  free_request(request);
+  return reply;
+}
+
+bool db_is_running()
+{
+  mtx_lock(lock);
+  bool _is_running = is_running;
+  mtx_unlock(lock);
+  return _is_running;
+}
 
 void db_free_reply(DBReply *reply)
 {
@@ -1447,38 +1713,44 @@ void db_free_reply(DBReply *reply)
   free(reply);
 }
 
-DBReply *db_print_reply(DBReply *res)
+DBReply *db_print_reply(DBReply *reply)
 {
-  if (!res)
+  if (!reply)
   {
     printf("(nil)\n");
-    return res;
+    return reply;
   }
 
-  switch (res->type)
+  switch (reply->type)
   {
+  case DB_TYPE_NULL:
+    printf("(nil)\n");
+    break;
   case DB_TYPE_ERROR:
-    printf("(error) %s\n", res->value.string ? res->value.string : "");
+    printf("(error) %s\n", reply->value.string ? reply->value.string : "");
     break;
   case DB_TYPE_STRING:
-    printf("%s\n", res->value.string ? res->value.string : "");
+    printf("%s\n", reply->value.string ? reply->value.string : "");
     break;
   case DB_TYPE_UINT:
-    printf("(uint) %u\n", res->value.unsigned_int);
+    printf("(uint) %lu\n", reply->value.unsigned_int);
     break;
   case DB_TYPE_LIST:
-    printf("(list) count: %u\n", res->value.list ? res->value.list->length : 0);
-    if (!res->value.list)
+    printf("(list) count: %u\n", reply->value.list ? reply->value.list->length : 0);
+    if (!reply->value.list)
       break;
-    db_uint_t i = 1;
-    DLNode *node = res->value.list->head;
+    db_uint_t i = 0;
+    DLNode *node = reply->value.list->head;
     while (node)
-      printf("  %u) %s\n", i++, node->data), node = node->next;
+      printf("  %u) %s\n", ++i, node->data), node = node->next;
+    break;
+  case DB_TYPE_BOOL:
+    printf("(bool) %s\n", reply->ok ? "true" : "false");
     break;
   default:
-    printf("(unknown)\n");
+    printf("(unknown) type=%lu\n", reply->type);
     break;
   }
 
-  return res;
+  return reply;
 }
